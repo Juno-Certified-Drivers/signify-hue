@@ -1,0 +1,12 @@
+# Push to main for a beta, tag v1.2.3 for a release. Everything else is inherited.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  driver:
+    uses: junohouse/driver-ci/.github/workflows/driver.yml@v1
+    secrets: inherit

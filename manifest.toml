@@ -1,0 +1,35 @@
+[driver]
+id = "signify.hue.bridge"
+name = "Philips Hue Bridge"
+manufacturer = "Signify"
+version = "1.1.0"
+runtime = "native"
+
+# The bridge is a device in its own right. It holds the address and the paired key once, and
+# every bulb behind it reads them from here — so a bridge that moves to a new IP is edited in
+# one place rather than six.
+[[proxy]]
+id = 1
+type = "bridge"
+primary = true
+name = "Bridge"
+capabilities = { child_driver = "signify.hue.bulb" }
+
+[[transport]]
+kind = "network"
+port = 443
+discovery = "mdns"
+
+[[property]]
+name = "Bridge address"
+type = "string"
+tooltip = "IP or hostname of the Hue bridge"
+
+[[property]]
+name = "Application key"
+type = "password"
+tooltip = "Issued by the bridge when its link button is pressed"
+
+[discovery]
+mdns = ["_hue._tcp"]
+mac_oui = ["00:17:88", "EC:B5:FA"]
