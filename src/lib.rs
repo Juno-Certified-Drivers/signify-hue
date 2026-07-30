@@ -24,7 +24,7 @@
 //! loaded module, and each can live in a different room. The bridge address and application
 //! key are per-device properties, so two bridges in one house need no special handling.
 
-use juno_driver_sdk::*;
+use driver_sdk::*;
 use serde_json::{Value, json};
 
 #[derive(Default)]
