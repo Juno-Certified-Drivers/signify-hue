@@ -6,3 +6,6 @@
 driver.dylib
 driver.so
 driver.dll
+
+# A driver builds as a cdylib, not a binary — the lock is not part of what ships.
+Cargo.lock
