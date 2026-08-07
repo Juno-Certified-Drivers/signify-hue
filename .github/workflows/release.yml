@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # Rebuild without a commit — for when what changed is the SDK or core, not this driver.
+  workflow_dispatch:
 
 jobs:
   driver:
