@@ -16,7 +16,6 @@ jobs:
     permissions:
       contents: write
     # Named rather than `inherit`. driver-ci lives in another organization, and `inherit`
-    # would hand it every secret this repo has instead of the two it needs.
+    # would hand it every secret this repo has instead of the one it needs.
     secrets:
-      CORE_TOKEN: ${{ secrets.CORE_TOKEN }}
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
