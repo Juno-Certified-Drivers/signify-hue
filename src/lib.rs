@@ -330,22 +330,24 @@ impl DriverModule for HueBulb {
                 control: 0,
                 data: request.into_bytes(),
             });
+
+            // And one read of every light, so a freshly started controller knows where the
+            // house stands without waiting for something to change.
+            //
+            // One request, not one per bulb. This used to be the bulb's own job, which meant
+            // twenty-four simultaneous GETs at every start — the bridge answered some of them
+            // with 429 and the rest arrived as a burst it had no reason to be asked for. The
+            // collection endpoint returns all of them in one answer, and core hands a bridge's
+            // answer to the devices behind it, so each bulb still picks itself out.
+            out.push(HostCall::Http(
+                HttpRequest::new("GET", format!("https://{bridge}/clip/v2/resource/light"))
+                    .header("hue-application-key", key),
+            ));
             return out;
         }
 
-        if let (Some(bridge), Some(key), Some(id)) = (
-            inst.property("Bridge address").as_str(),
-            inst.property("Application key").as_str(),
-            inst.property("Light id").as_str(),
-        ) {
-            out.push(HostCall::Http(
-                HttpRequest::new(
-                    "GET",
-                    format!("https://{bridge}/clip/v2/resource/light/{id}"),
-                )
-                .header("hue-application-key", key),
-            ));
-        }
+        // A bulb asks for nothing. Its state arrives with the bridge's read above, and every
+        // change after that arrives on the stream.
         out
     }
 
@@ -366,12 +368,22 @@ impl DriverModule for HueBulb {
         if note != "http_response" {
             return Vec::new();
         }
-        // CLIP v2 answers `{"errors": [], "data": [ … ]}` even for a single resource.
-        let Some(light) = args
+        // CLIP v2 answers `{"errors": [], "data": [ … ]}` — one entry for a single resource,
+        // every light for the collection. Core hands a bridge's answer to the devices behind
+        // it, so this is reached with the whole house in it and has to find its own line.
+        let Some(mine) = inst.property("Light id").as_str().map(str::to_string) else {
+            return Vec::new(); // the bridge, hearing its own answer
+        };
+        let Some(data) = args
             .get("body")
             .and_then(|b| b.get("data"))
             .and_then(Value::as_array)
-            .and_then(|d| d.first())
+        else {
+            return Vec::new();
+        };
+        let Some(light) = data
+            .iter()
+            .find(|l| l.get("id").and_then(Value::as_str) == Some(mine.as_str()))
         else {
             return Vec::new();
         };
