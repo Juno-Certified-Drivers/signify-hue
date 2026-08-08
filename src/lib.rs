@@ -1106,7 +1106,16 @@ impl HueBulb {
                 // overwritten with the bulb driver here, which was harmless while bulbs were the
                 // only thing on offer and would now quietly turn every sensor and every keypad into
                 // a light that 404s on its first command.
+                // The rules the bridge already has, for whatever was actually picked. Built before
+                // the inherited properties are stripped, because that is what identifies a device.
+                let catalog: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+
                 if state.get("browse").and_then(Value::as_bool) == Some(true) {
+                    let rules = catalog::rules(&catalog, &chosen);
                     let devices = chosen
                         .into_iter()
                         .map(|mut c| {
@@ -1115,7 +1124,7 @@ impl HueBulb {
                             c
                         })
                         .collect();
-                    return (SetupStep::Done { devices }, Value::Null);
+                    return (SetupStep::Done { devices, rules }, Value::Null);
                 }
 
                 let mut devices = vec![Candidate {
@@ -1139,13 +1148,17 @@ impl HueBulb {
                     room: String::new(),
                 }];
 
+                // Indices are into the list core is handed, and the bridge is the first entry of
+                // it — so the rules are built against that list rather than against `chosen`,
+                // which is one shorter and would point every rule at the wrong device.
                 for mut c in chosen {
                     // Drop the inherited copies — the bridge holds them now.
                     c.properties.remove("Bridge address");
                     c.properties.remove("Application key");
                     devices.push(c);
                 }
-                (SetupStep::Done { devices }, Value::Null)
+                let rules = catalog::rules(&catalog, &devices);
+                (SetupStep::Done { devices, rules }, Value::Null)
             }
 
             other => (

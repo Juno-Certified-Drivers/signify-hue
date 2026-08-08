@@ -70,9 +70,37 @@ kitchen both names it — "controls Kitchen" beats "Hue dimmer switch 2" in a li
 from — and places it, since battery remotes are routinely in no Hue room at all and what a switch
 drives is the best available answer to where it is.
 
-Nothing here imports a Hue automation as a Juno rule. The two do not mean the same thing, and a
-rule whose origin nobody can see is worse than no rule. The behaviours are read for identity and
-placement only.
+### Bringing the rules over
+
+The behaviours are also offered as Juno automations, and they arrive **switched off** and tagged
+with the driver that read them. That is the whole of what makes it safe: an imported rule is this
+driver's *interpretation* of somebody else's automation, and nothing should start behaving
+differently in a house because a bridge was adopted. They land on the Automations page as
+proposals with their origin written on them.
+
+How much of an interpretation is worth being plain about. A Hue behaviour says *that* a switch
+drives a room; the per-button detail lives in a script whose shape is the script's own business and
+changes between versions. So what is reconstructed is the layout every Hue remote has had since the
+first one:
+
+| Button | Rule |
+| --- | --- |
+| Top | `clicked` → room `all_lights_on` |
+| Brighter | `clicked` **and** `repeating` → room `dim_up` |
+| Dimmer | `clicked` **and** `repeating` → room `dim_down` |
+| Bottom | `clicked` → room `all_lights_off` |
+
+Brighter and dimmer take two triggers because that is one intention: Hue repeats while a button is
+held, and `dim_up` is relative, so the same rule gives a step per click and a ramp per hold. A
+motion sensor the bridge already lights a room with becomes one rule on `detected`.
+
+A Tap Dial contributes only its ring — turn right brightens, turn left dims. Its four buttons
+recall scenes, and a scene is the one thing on a Hue bridge with no Juno representation at all;
+guessing a brightness for "Relax" would be inventing something nobody asked for.
+
+Every imported rule crosses the same gate a hand-written one does. A trigger must name an event the
+contract declares, a room command must exist, arguments are range-checked. Anything that does not
+survive that is reported and dropped rather than bent until it fits.
 
 The configuration inside a behaviour is shaped by whichever script it is an instance of, and those
 shapes are neither documented nor stable. Rather than walk a known path — which would work for
