@@ -25,7 +25,7 @@
 //! key are per-device properties, so two bridges in one house need no special handling.
 
 use driver_sdk::*;
-use serde_json::{Value, json};
+use driver_sdk::{Value, json};
 
 #[derive(Default)]
 pub struct HueBulb;
@@ -801,7 +801,7 @@ impl HueBulb {
                 let key = state.get("key").and_then(Value::as_str).unwrap_or("").to_string();
                 let chosen: Vec<Candidate> = input
                     .get("chosen")
-                    .and_then(|c| serde_json::from_value(c.clone()).ok())
+                    .and_then(|c| driver_sdk::serde_json::from_value(c.clone()).ok())
                     .unwrap_or_default();
 
                 // The bridge comes first and carries the connection; the bulbs carry only

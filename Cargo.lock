@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "driver-sdk"
-version = "0.5.0"
-source = "git+https://github.com/junohouse/driver-sdk?tag=v0.5.0#59d370f261d8cb3284ae423cbcfe82077288d374"
+version = "0.7.0"
+source = "git+https://github.com/junohouse/driver-sdk?tag=v0.7.0#7674508cbff4a5f9f663806c2f80a85572283236"
 dependencies = [
  "serde",
  "serde_json",
@@ -22,7 +22,6 @@ name = "juno-driver-hue"
 version = "1.1.0"
 dependencies = [
  "driver-sdk",
- "serde_json",
 ]
 
 [[package]]
