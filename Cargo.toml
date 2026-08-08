@@ -24,7 +24,19 @@ serde_json = "1"
 # workspace is claimed by that workspace and refuses to build.
 [workspace]
 
-# A driver is a dylib the controller loads; a debug-sized one is several times larger to ship.
+# A driver is a dylib the controller loads, and it is downloaded and kept per project — so it
+# is tuned for size rather than for the last few percent of speed. A driver spends its time
+# waiting on a device, not in its own code.
+#
+# Measured on denon-avr: 667 KB -> 473 KB, and about 40% of what is left is Rust's own std,
+# statically linked into every cdylib. `strip` accounts for the last 80 KB of it and does not
+# touch the exported `juno_*` symbols, which live in the dynamic symbol table.
+#
+# `panic = "abort"` is deliberately NOT here. `export_driver!` wraps dispatch in `catch_unwind`
+# so a driver that panics reports a warning instead of taking the controller down with it.
+# Aborting would trade that for a few KB and make one bad driver everybody's outage.
 [profile.release]
-opt-level = 2
-codegen-units = 16
+opt-level = "z"
+codegen-units = 1
+lto = true
+strip = true
