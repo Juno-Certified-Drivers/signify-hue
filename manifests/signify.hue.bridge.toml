@@ -19,6 +19,10 @@ capabilities = { child_driver = "signify.hue.bulb" }
 kind = "network"
 port = 443
 discovery = "mdns"
+# Held open, and wrapped in TLS. The bridge presents a self-signed certificate, and it is
+# trusted on the strength of the application key it issued us rather than a public CA.
+keepalive = true
+tls = true
 
 [[property]]
 name = "Bridge address"

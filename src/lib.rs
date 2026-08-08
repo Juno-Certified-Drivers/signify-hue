@@ -94,6 +94,93 @@ impl HueBulb {
         ))
     }
 
+    /// One frame of the bridge's event stream, as it concerns this bulb.
+    ///
+    /// The frame is the whole house — a scene recall names eight lights in one push — and every
+    /// bulb behind the bridge is handed the same text. Keeping only what names us is the rule
+    /// that makes one connection serve twenty-four devices: without it, one light changing at a
+    /// wall switch would move all of them.
+    ///
+    /// ```text
+    /// [{"type":"update","data":[{"id":"<rid>","type":"light","dimming":{"brightness":42}}]}]
+    /// ```
+    fn on_stream(&self, inst: &mut Instance, args: &Args) -> Vec<HostCall> {
+        let Some(mine) = inst.property("Light id").as_str().map(str::to_string) else {
+            return Vec::new(); // the bridge itself, hearing its own stream
+        };
+        let Some(text) = args.get("data").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Ok(frame) = serde_json::from_str::<Value>(text) else {
+            return Vec::new(); // a keep-alive or a partial line core has not finished
+        };
+
+        let mut out = Vec::new();
+        for update in frame.as_array().into_iter().flatten() {
+            for resource in update.get("data").and_then(Value::as_array).into_iter().flatten() {
+                if resource.get("id").and_then(Value::as_str) != Some(mine.as_str()) {
+                    continue;
+                }
+                out.extend(Self::report(inst, resource));
+            }
+        }
+        out
+    }
+
+    /// Turn a light resource — from a poll or from the stream, they are the same shape — into
+    /// what changed. Shared so the two paths cannot drift into disagreeing about a bulb.
+    ///
+    /// An event carries only the fields that moved: brightness alone when someone drags a
+    /// slider, `on` alone when they flick a switch. So a missing field means "unchanged", and
+    /// the remembered value fills it in — reading it as zero would darken the bulb on screen
+    /// every time somebody changed its colour.
+    fn report(inst: &mut Instance, light: &Value) -> Vec<HostCall> {
+        let mut out = Vec::new();
+        let known_level = inst.scratch.get("level").and_then(Value::as_u64).unwrap_or(100);
+        let known_on = inst.scratch.get("on").and_then(Value::as_bool);
+
+        let on = light.pointer("/on/on").and_then(Value::as_bool).or(known_on);
+        let brightness = light.pointer("/dimming/brightness").and_then(Value::as_f64);
+
+        if on.is_some() || brightness.is_some() {
+            let level = match on {
+                Some(false) => 0,
+                _ => brightness
+                    .map(|b| b.round().clamp(1.0, 100.0) as u64)
+                    .unwrap_or(known_level),
+            };
+            if level > 0 {
+                inst.scratch.insert("level".into(), json!(level));
+            }
+            inst.scratch.insert("on".into(), json!(level > 0));
+
+            let mut a = Args::new();
+            a.insert("level".into(), json!(level));
+            out.push(HostCall::notify(1, "level_changed", a));
+        }
+
+        if let Some(mirek) = light
+            .pointer("/color_temperature/mirek")
+            .and_then(Value::as_u64)
+            .filter(|m| *m > 0)
+        {
+            let mut a = Args::new();
+            a.insert("kelvin".into(), json!(1_000_000 / mirek));
+            out.push(HostCall::notify(1, "cct_changed", a));
+        }
+
+        if let (Some(x), Some(y)) = (
+            light.pointer("/color/xy/x").and_then(Value::as_f64),
+            light.pointer("/color/xy/y").and_then(Value::as_f64),
+        ) {
+            let mut a = Args::new();
+            a.insert("hue".into(), json!(x));
+            a.insert("sat".into(), json!(y));
+            out.push(HostCall::notify(1, "color_changed", a));
+        }
+        out
+    }
+
     /// Report the change immediately rather than waiting for the bridge.
     ///
     /// The bulb is on a mesh; a round trip is 100–300 ms and the UI would visibly lag. We
@@ -218,6 +305,34 @@ impl DriverModule for HueBulb {
         a.insert("online".into(), json!(true));
         out.push(HostCall::notify(1, "online_changed", a));
 
+        // The bridge — no `Light id`, so this instance is the hub rather than a bulb — opens
+        // the event stream, once, for the whole house.
+        //
+        // Nothing here is polled, and until this existed nothing was: a bulb changed in the
+        // Hue app or at a wall switch never got back to Juno, because the only thing that ever
+        // reported a level was this driver stating its own intent after a command. One
+        // subscription is what Hue offers and all it wants — core hands every frame to the
+        // bulbs behind this bridge, and each keeps the ones naming it.
+        if inst.property("Light id").as_str().is_none()
+            && let (Some(bridge), Some(key)) = (
+                inst.property("Bridge address").as_str(),
+                inst.property("Application key").as_str(),
+            )
+        {
+            let request = format!(
+                "GET /eventstream/clip/v2 HTTP/1.1\r\n\
+                 Host: {bridge}\r\n\
+                 Accept: text/event-stream\r\n\
+                 Cache-Control: no-cache\r\n\
+                 hue-application-key: {key}\r\n\r\n"
+            );
+            out.push(HostCall::Tx {
+                control: 0,
+                data: request.into_bytes(),
+            });
+            return out;
+        }
+
         if let (Some(bridge), Some(key), Some(id)) = (
             inst.property("Bridge address").as_str(),
             inst.property("Application key").as_str(),
@@ -243,6 +358,11 @@ impl DriverModule for HueBulb {
         note: &str,
         args: &Args,
     ) -> Vec<HostCall> {
+        // A frame off the bridge's event stream. Core hands it to every device behind that
+        // bridge, so the first thing to do is find out whether any of it is about this bulb.
+        if note == "rx" {
+            return self.on_stream(inst, args);
+        }
         if note != "http_response" {
             return Vec::new();
         }
@@ -255,41 +375,7 @@ impl DriverModule for HueBulb {
         else {
             return Vec::new();
         };
-
-        let mut out = Vec::new();
-        let on = light.pointer("/on/on").and_then(Value::as_bool);
-        let brightness = light
-            .pointer("/dimming/brightness")
-            .and_then(Value::as_f64);
-
-        if let Some(on) = on {
-            // Hue keeps brightness and on/off separately; Juno's level folds them together,
-            // so an off bulb is level 0 whatever brightness it remembers.
-            let level = if on {
-                brightness.unwrap_or(100.0).round().clamp(1.0, 100.0) as u64
-            } else {
-                0
-            };
-            if level > 0 {
-                inst.scratch.insert("level".into(), json!(level));
-            }
-            inst.scratch.insert("on".into(), json!(on));
-
-            let mut a = Args::new();
-            a.insert("level".into(), json!(level));
-            out.push(HostCall::notify(1, "level_changed", a));
-        }
-
-        if let Some(mirek) = light
-            .pointer("/color_temperature/mirek")
-            .and_then(Value::as_u64)
-            .filter(|m| *m > 0)
-        {
-            let mut a = Args::new();
-            a.insert("kelvin".into(), json!(1_000_000 / mirek));
-            out.push(HostCall::notify(1, "cct_changed", a));
-        }
-        out
+        Self::report(inst, light)
     }
 }
 
