@@ -41,15 +41,24 @@ pub fn compact(response: Option<&Value>) -> Vec<Value> {
 
             let buttons = of_type("button");
             let motion = of_type("motion");
-            // A bulb, the bridge itself, or a plug: all real devices, none of them ours. Bulbs come
-            // off `/light` in the step after this one, with the colour and dimming detail that
-            // decides which capabilities they get — there is nothing to gain by catching them here.
-            if buttons.is_empty() && motion.is_empty() {
+            let lights = of_type("light");
+            // The bridge itself, and anything whose only services are plumbing. Everything else is
+            // kept — including bulbs, which are not offered from here but are the reason this step
+            // knows anything: a room lists its *devices*, and a bulb's room can only be found by
+            // going from its light service, to the device that owns it, to the room holding that.
+            if buttons.is_empty() && motion.is_empty() && lights.is_empty() {
                 return None;
             }
 
             let one = |list: Vec<String>| list.into_iter().next();
             let mut entry = BTreeMap::new();
+            entry.insert(
+                "id".to_string(),
+                json!(device.get("id").and_then(Value::as_str).unwrap_or("")),
+            );
+            if !lights.is_empty() {
+                entry.insert("lights".to_string(), json!(lights));
+            }
             entry.insert(
                 "name".to_string(),
                 json!(
@@ -131,6 +140,188 @@ pub fn order_buttons(catalog: &mut [Value], response: Option<&Value>) {
     }
 }
 
+/// File each device under the Hue room holding it.
+///
+/// This is the step that makes adopting a whole house bearable. A bridge is usually one bridge for
+/// everything, and its bulbs are named by the app — "Hue color lamp 3", forty times over. Somebody
+/// already did the work of saying which room each one is in, once, in the Hue app; without reading
+/// it back, adopting the bridge means doing that work again from a list where every row looks the
+/// same.
+///
+/// Rooms rather than zones, because a Hue room is exclusive — a device is in exactly one — and a
+/// zone is not. "Downstairs" and "Evening" are both zones and neither is where a lamp *is*.
+pub fn assign_rooms(catalog: &mut [Value], response: Option<&Value>) {
+    let mut of_device: BTreeMap<String, String> = BTreeMap::new();
+    for room in rooms(response) {
+        for child in room.children {
+            of_device.insert(child, room.name.clone());
+        }
+    }
+    for device in catalog.iter_mut() {
+        let Some(id) = device.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(name) = of_device.get(id) {
+            device["room"] = json!(name);
+        }
+    }
+}
+
+/// Room resource id to room name, as a plain object so it can ride in the setup state.
+///
+/// Stashed rather than re-fetched: the behaviours step needs it and runs after the rooms step, and
+/// asking the bridge for the same list twice to avoid carrying a dozen short strings would be the
+/// wrong trade.
+pub fn room_names(response: Option<&Value>) -> Value {
+    let mut out = driver_sdk::serde_json::Map::new();
+    if let Some(data) = response
+        .and_then(|r| r.get("data"))
+        .and_then(Value::as_array)
+    {
+        for room in data {
+            if let (Some(id), Some(name)) = (
+                room.get("id").and_then(Value::as_str),
+                room.pointer("/metadata/name").and_then(Value::as_str),
+            ) {
+                out.insert(id.to_string(), json!(name));
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// A room, reduced to the two things worth keeping.
+struct Group {
+    name: String,
+    children: Vec<String>,
+}
+
+fn rooms(response: Option<&Value>) -> Vec<Group> {
+    let Some(data) = response
+        .and_then(|r| r.get("data"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|room| {
+            Some(Group {
+                name: room.pointer("/metadata/name")?.as_str()?.to_string(),
+                children: room
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|child| Some(child.get("rid")?.as_str()?.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Every `{rid, rtype}` anywhere inside a value, however deeply it is nested.
+///
+/// Deliberately structure-blind. A behaviour's `configuration` is shaped by whichever script it is
+/// an instance of, those shapes are not documented, and Signify adds new ones — so reading it by
+/// walking a known path would work for the dimmer script today and silently stop working for the
+/// next one. What every script does have in common is that it refers to things by `rid`, so that
+/// is what is looked for and the rest is left alone.
+fn referenced(value: &Value, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            if let (Some(Value::String(rid)), Some(Value::String(rtype))) =
+                (map.get("rid"), map.get("rtype"))
+            {
+                out.push((rid.clone(), rtype.clone()));
+            }
+            for v in map.values() {
+                referenced(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                referenced(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the bridge's own automations say each control surface drives.
+///
+/// A Hue dimmer paired to the app is already wired to something — that is what pairing it *did* —
+/// and the bridge holds that as a `behavior_instance`. Reading it back is worth two things. It
+/// names the switch: "Hue dimmer switch 2" and "controls the Kitchen" are very different rows to
+/// pick from in a list. And where a remote is in no Hue room of its own, which is common for a
+/// battery device somebody stuck to a wall, what it controls is the best available answer to where
+/// it lives.
+///
+/// A suggestion either way. Nothing here imports a Hue automation as a Juno rule: the two have
+/// different semantics, and a rule the household cannot see the origin of is worse than no rule.
+pub fn apply_behaviours(catalog: &mut [Value], behaviours: Option<&Value>, room_names: &Value) {
+    let Some(data) = behaviours
+        .and_then(|r| r.get("data"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    for behaviour in data {
+        let mut refs = Vec::new();
+        referenced(behaviour, &mut refs);
+        let targets: Vec<String> = refs
+            .iter()
+            .filter(|(_, rtype)| rtype == "room")
+            .filter_map(|(rid, _)| Some(room_names.get(rid)?.as_str()?.to_string()))
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+
+        // Which of our devices this behaviour is about. Matched on the device itself or on any of
+        // its buttons, because a script may name either.
+        for device in catalog.iter_mut() {
+            let id = device.get("id").and_then(Value::as_str).unwrap_or("");
+            let mut mine: Vec<String> = vec![id.to_string()];
+            if let Some(buttons) = device.get("buttons").and_then(Value::as_array) {
+                mine.extend(buttons.iter().filter_map(|b| Some(b.as_str()?.to_string())));
+            }
+            if !refs.iter().any(|(rid, _)| mine.iter().any(|m| m == rid)) {
+                continue;
+            }
+            let mut controls: Vec<String> = device
+                .get("controls")
+                .and_then(Value::as_array)
+                .map(|c| {
+                    c.iter()
+                        .filter_map(|v| Some(v.as_str()?.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for t in &targets {
+                if !controls.contains(t) {
+                    controls.push(t.clone());
+                }
+            }
+            device["controls"] = json!(controls);
+        }
+    }
+}
+
+/// The Hue room a bulb's light service belongs to, found through the device that owns it.
+pub fn room_of_light(catalog: &[Value], light: &str) -> Option<String> {
+    catalog.iter().find_map(|device| {
+        let owns = device
+            .get("lights")
+            .and_then(Value::as_array)?
+            .iter()
+            .any(|l| l.as_str() == Some(light));
+        (owns).then(|| device.get("room")?.as_str().map(str::to_string))?
+    })
+}
+
 /// Which manifest a control surface is, from its shape rather than its model number.
 ///
 /// Shape rather than a list of model ids because the bridge is a Zigbee hub and not everything on it
@@ -168,6 +359,21 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
             .map(str::to_string);
         let model = device.get("model").and_then(Value::as_str).unwrap_or("");
         let rid = |field: &str| device.get(field).and_then(Value::as_str).map(str::to_string);
+        let controls: Vec<String> = device
+            .get("controls")
+            .and_then(Value::as_array)
+            .map(|c| {
+                c.iter()
+                    .filter_map(|v| Some(v.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Where the bridge says it is, and failing that where what it drives is. The second is the
+        // useful one for a battery remote: those are often in no Hue room at all, and "it turns the
+        // kitchen lights on and off" is a better answer to where it lives than nothing.
+        let room = rid("room")
+            .or_else(|| controls.first().cloned())
+            .unwrap_or_default();
 
         let mut properties: BTreeMap<String, Value> = BTreeMap::new();
         properties.insert("Bridge address".into(), json!(address));
@@ -194,7 +400,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                 properties.insert("Rotary id".into(), json!(rotary));
             }
             let dropped = buttons.len().saturating_sub(slots);
-            let verified = match (product.as_deref(), dropped) {
+            let mut verified = match (product.as_deref(), dropped) {
                 // Say it plainly rather than quietly binding four of five. Somebody holding the
                 // remote is the only person who can tell us what the fifth one is.
                 (_, n) if n > 0 => format!(
@@ -204,6 +410,11 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                 (Some(p), _) => format!("{p} — {} button(s)", buttons.len()),
                 (None, _) => format!("{} button(s) on {model}", buttons.len()),
             };
+            // What the bridge already has it wired to. The single most useful thing that can be
+            // said about a row in a list of things called "Hue dimmer switch 2".
+            if !controls.is_empty() {
+                verified.push_str(&format!(", controls {}", controls.join(" and ")));
+            }
             out.push(Candidate {
                 label: name.clone(),
                 kind: if rid("rotary").is_some() {
@@ -214,6 +425,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                 driver_id: driver_id.into(),
                 properties: properties.clone(),
                 verified,
+                room,
             });
             continue;
         }
@@ -239,6 +451,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                     Some(p) => format!("{p} — reports {}", measures.join(", ")),
                     None => format!("reports {}", measures.join(", ")),
                 },
+                room,
             });
         }
     }
@@ -260,8 +473,14 @@ mod tests {
         })
     }
 
+    /// A bulb is kept by `compact` and not offered by `candidates`, and the difference matters.
+    ///
+    /// It is kept because a Hue room lists devices while a bulb is adopted by its light *service*,
+    /// so the only route from one to the other is through the device that owns it. It is not
+    /// offered because the `/light` step builds bulbs properly, with the colour and dimming detail
+    /// that decides their capabilities. The bridge is neither kept nor offered.
     #[test]
-    fn bulbs_and_the_bridge_are_not_offered_here() {
+    fn a_bulb_is_kept_for_its_room_but_not_offered_as_a_device() {
         let response = json!({ "data": [
             device("Bridge", json!([{ "rid": "b1", "rtype": "bridge" }])),
             device("Kitchen bulb", json!([{ "rid": "l1", "rtype": "light" }])),
@@ -272,8 +491,73 @@ mod tests {
             ])),
         ]});
         let catalog = compact(Some(&response));
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0]["name"], json!("Hall sensor"));
+        let names: Vec<&str> = catalog
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Kitchen bulb", "Hall sensor"], "the bridge is not a device");
+
+        let offered: Vec<String> = candidates(&catalog, "10.0.0.2", "key")
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(offered, vec!["Hall sensor".to_string()]);
+    }
+
+    /// The whole point of the exercise: a bulb inherits the room the bridge already filed it under.
+    #[test]
+    fn a_bulb_finds_its_room_through_the_device_that_owns_it() {
+        let devices = json!({ "data": [
+            device("Hue color lamp 3", json!([{ "rid": "l1", "rtype": "light" }])),
+        ]});
+        let mut catalog = compact(Some(&devices));
+        let rooms = json!({ "data": [{
+            "id": "room-1",
+            "metadata": { "name": "Kitchen" },
+            "children": [{ "rid": "dev-Hue color lamp 3", "rtype": "device" }],
+        }]});
+        assign_rooms(&mut catalog, Some(&rooms));
+        assert_eq!(room_of_light(&catalog, "l1").as_deref(), Some("Kitchen"));
+        assert_eq!(room_of_light(&catalog, "nobody"), None);
+    }
+
+    /// A dimmer in no Hue room of its own still has a place: the one it drives.
+    ///
+    /// Battery remotes are routinely filed nowhere, and "controls the Kitchen" is both the best
+    /// available answer to where it is and a far better name than "Hue dimmer switch 2".
+    #[test]
+    fn a_switch_is_placed_and_named_by_what_the_bridge_has_it_driving() {
+        let devices = json!({ "data": [
+            device("Hue dimmer switch 2", json!([
+                { "rid": "btn1", "rtype": "button" },
+                { "rid": "btn2", "rtype": "button" },
+                { "rid": "btn3", "rtype": "button" },
+                { "rid": "btn4", "rtype": "button" },
+            ])),
+        ]});
+        let mut catalog = compact(Some(&devices));
+        let rooms = json!({ "data": [
+            { "id": "room-1", "metadata": { "name": "Kitchen" }, "children": [] },
+        ]});
+        let names = room_names(Some(&rooms));
+        // The shape a Hue "dimmer switch" behaviour actually has: the device nested somewhere in a
+        // configuration whose layout is the script's business, and the room it drives beside it.
+        let behaviours = json!({ "data": [{
+            "id": "beh-1",
+            "configuration": {
+                "device": { "rid": "dev-Hue dimmer switch 2", "rtype": "device" },
+                "where": [{ "group": { "rid": "room-1", "rtype": "room" } }],
+            },
+        }]});
+        apply_behaviours(&mut catalog, Some(&behaviours), &names);
+
+        let offered = candidates(&catalog, "10.0.0.2", "key");
+        assert_eq!(offered[0].room, "Kitchen", "it goes where the thing it drives is");
+        assert!(
+            offered[0].verified.contains("controls Kitchen"),
+            "and says so in the list: {}",
+            offered[0].verified
+        );
     }
 
     #[test]

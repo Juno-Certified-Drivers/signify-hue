@@ -38,10 +38,48 @@ another vendor pairs with it and reports presses exactly the same way.
 Discovered over mDNS (`_hue._tcp`). Pairing needs the bridge's link button pressed; the driver
 polls until it is, because the bridge refuses the request until then.
 
-Setup then reads three collections in turn — `/device` for what is paired and how its services
-group, `/button` for `control_id` so buttons are offered in the order they are printed on the
-remote, and `/light` for the bulbs — and offers all of it at once. A bridge carrying accessories
-and no bulbs of its own is a real setup and is not refused.
+Setup then reads five collections in turn and offers all of it at once:
+
+| Read | For |
+| --- | --- |
+| `/device` | What is paired, and how each thing's services group |
+| `/button` | `control_id`, so buttons are offered in the order printed on the remote |
+| `/room` | Where the bridge says everything lives |
+| `/behavior_instance` | What the bridge already has each switch driving |
+| `/light` | The bulbs, with the colour and dimming detail that decides their capabilities |
+
+A bridge carrying accessories and no bulbs of its own is a real setup and is not refused.
+
+### Taking the bridge's word for where things are
+
+The last two reads are what make adopting a whole house bearable. A Hue bridge is usually the
+only one in the building, and its bulbs are named by the app — "Hue color lamp 3", forty times
+over. Somebody already sat down and filed every one of them into a room. Without reading that
+back, adopting the bridge means doing the same work again from a list where every row looks
+identical.
+
+So each candidate carries the Hue room it is in, and core matches or creates that room at the
+moment of adoption. It is a **suggestion**, not an instruction: nothing is created behind
+anybody's back, the list is on screen when it happens, and the driver cannot rename or delete a
+room. Rooms rather than zones, because a Hue room is exclusive — a device is in exactly one — and
+"Downstairs" and "Evening" are both zones and neither is where a lamp *is*.
+
+`behavior_instance` is read for the same reason and answers a second question. A dimmer paired
+through the app is already wired to something; that is what pairing it did. Knowing it drives the
+kitchen both names it — "controls Kitchen" beats "Hue dimmer switch 2" in a list you have to pick
+from — and places it, since battery remotes are routinely in no Hue room at all and what a switch
+drives is the best available answer to where it is.
+
+Nothing here imports a Hue automation as a Juno rule. The two do not mean the same thing, and a
+rule whose origin nobody can see is worse than no rule. The behaviours are read for identity and
+placement only.
+
+The configuration inside a behaviour is shaped by whichever script it is an instance of, and those
+shapes are neither documented nor stable. Rather than walk a known path — which would work for
+today's dimmer script and quietly stop working for the next one — the driver collects every
+`{rid, rtype}` anywhere in the structure and keeps the ones that name a room. Deliberately
+structure-blind, because the one thing every script has in common is that it refers to things by
+resource id.
 
 ## State
 

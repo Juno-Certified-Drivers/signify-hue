@@ -854,6 +854,88 @@ impl HueBulb {
                     SetupStep::Fetch {
                         request: HttpRequest::new(
                             "GET",
+                            format!("https://{address}/clip/v2/resource/room"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading the rooms".into(),
+                    },
+                    json!({
+                        "phase": "rooms",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
+            // Where the bridge says everything lives.
+            //
+            // The step that decides whether adopting a house is one press or an afternoon. A Hue
+            // bridge is usually the only one in the building and its bulbs are named by the app —
+            // "Hue color lamp 3", forty times — so the room is the only thing distinguishing one
+            // row from another, and somebody already filed all of it once in the Hue app.
+            "rooms" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut found: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                catalog::assign_rooms(&mut found, input.get("response"));
+                let names = catalog::room_names(input.get("response"));
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
+                            format!("https://{address}/clip/v2/resource/behavior_instance"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading what the switches already control".into(),
+                    },
+                    json!({
+                        "phase": "behaviours",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "rooms": names,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
+            // What the bridge's own automations wire each switch to.
+            //
+            // Not imported as rules — Hue's semantics are not Juno's, and a rule whose origin
+            // nobody can see is worse than no rule. It is read for what it says about identity and
+            // place: "controls the Kitchen" is a usable name for a thing the app called "Hue
+            // dimmer switch 2", and for a battery remote sitting in no Hue room at all it is the
+            // best answer available to where the thing is.
+            "behaviours" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut found: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let names = state.get("rooms").cloned().unwrap_or(Value::Null);
+                catalog::apply_behaviours(&mut found, input.get("response"), &names);
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
                             format!("https://{address}/clip/v2/resource/light"),
                         )
                         .header("hue-application-key", &key),
@@ -908,6 +990,16 @@ impl HueBulb {
                     .cloned()
                     .unwrap_or_default();
 
+                // Read before the bulbs are built, because each of them wants its room out of it.
+                // A bulb is offered by its *light service*, and a Hue room lists *devices* — so the
+                // hop from one to the other goes through the device that owns the service, which is
+                // exactly what the catalog recorded two steps ago.
+                let found: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+
                 let mut options: Vec<Candidate> = data
                     .iter()
                     .filter_map(|light| {
@@ -946,22 +1038,15 @@ impl HueBulb {
                             .into_iter()
                             .collect(),
                             verified,
+                            room: catalog::room_of_light(&found, id).unwrap_or_default(),
                         })
                     })
                     .collect();
                 options.sort_by(|a, b| a.label.cmp(&b.label));
                 let bulbs = options.len();
 
-                // The sensors and controls gathered two steps ago, already sorted among themselves.
-                let accessories = catalog::candidates(
-                    &state
-                        .get("catalog")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default(),
-                    &address,
-                    &key,
-                );
+                // The sensors and controls gathered earlier, already sorted among themselves.
+                let accessories = catalog::candidates(&found, &address, &key);
                 let extras = accessories.len();
                 options.extend(accessories);
 
@@ -1048,6 +1133,10 @@ impl HueBulb {
                     .into_iter()
                     .collect(),
                     verified: format!("{} device(s) behind it", chosen.len()),
+                    // A bridge lives in a cupboard and serves the whole house. Core refuses to
+                    // place infrastructure anyway; saying nothing here is the same answer said
+                    // once rather than twice.
+                    room: String::new(),
                 }];
 
                 for mut c in chosen {
