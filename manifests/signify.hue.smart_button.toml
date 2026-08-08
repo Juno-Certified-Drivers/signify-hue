@@ -1,0 +1,28 @@
+[driver]
+id = "signify.hue.smart_button"
+name = "Philips Hue Smart Button"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+parent = "signify.hue.bridge"
+
+# One button, one binding. The simplest thing this driver installs, and the one that shows most
+# plainly what a `button` proxy is: it has no state to speak of, takes no commands, and exists
+# entirely so that a rule has something to trigger on.
+
+[[proxy]]
+id = 1
+type = "button"
+name = "Button"
+primary = true
+capabilities = { has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+
+[[property]]
+name = "Button 1 id"
+type = "string"
+tooltip = "Resource id of the button"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"

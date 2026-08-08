@@ -1,0 +1,69 @@
+[driver]
+id = "signify.hue.dimmer"
+name = "Philips Hue Dimmer Switch"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+parent = "signify.hue.bridge"
+
+# Four buttons, four bindings. A rule triggers on a notification arriving at a binding, so this is
+# what makes "when the hall dimmer's brighter button is held" expressible at all — with one binding
+# for the whole remote, every rule would fire on every button.
+#
+# The names below are the first-generation layout (RWL020/RWL021), which is also what the second
+# generation (RWL022) does for the two middle buttons. On an RWL022 the top button is a single power
+# toggle rather than On, and the bottom one is the Hue scene button rather than Off — the presses
+# arrive on the same control ids, so everything works, but the binding is worth renaming. Renaming a
+# binding is supported and does not disturb the rules attached to it.
+
+[[proxy]]
+id = 1
+type = "button"
+name = "On"
+primary = true
+# Battery is declared on this binding alone. It belongs to the remote rather than to any one button,
+# and four identical readouts on one device would be four things to keep in step and nothing gained.
+capabilities = { label = "On", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+
+[[proxy]]
+id = 2
+type = "button"
+name = "Brighter"
+capabilities = { label = "Brighter", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[proxy]]
+id = 3
+type = "button"
+name = "Dimmer"
+capabilities = { label = "Dimmer", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[proxy]]
+id = 4
+type = "button"
+name = "Off"
+capabilities = { label = "Off", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[property]]
+name = "Button 1 id"
+type = "string"
+tooltip = "Resource id of the first button"
+
+[[property]]
+name = "Button 2 id"
+type = "string"
+tooltip = "Resource id of the second button"
+
+[[property]]
+name = "Button 3 id"
+type = "string"
+tooltip = "Resource id of the third button"
+
+[[property]]
+name = "Button 4 id"
+type = "string"
+tooltip = "Resource id of the fourth button"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"

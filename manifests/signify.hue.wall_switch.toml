@@ -1,0 +1,47 @@
+[driver]
+id = "signify.hue.wall_switch"
+name = "Philips Hue Wall Switch Module"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+parent = "signify.hue.bridge"
+
+# The module that sits behind an existing rocker or toggle and turns it into something the bridge
+# hears. Two bindings, because that is what the hardware reports in its two-rocker mode.
+#
+# In single-rocker mode the bridge publishes one button service and the second binding never fires.
+# It is left declared rather than split into a separate one-button driver: the module can be
+# switched between modes in the Hue app without being re-paired, and a device that changed shape on
+# a setting would have to be removed and re-added to follow it.
+#
+# Note what this is not. The module reports presses; it does not switch the load — the load stays
+# wired to whatever it was always wired to, and Hue's own bulbs behind it stay permanently powered.
+# So this is a `button`, not a `switch`, and there is nothing here to turn on.
+
+[[proxy]]
+id = 1
+type = "button"
+name = "Top"
+primary = true
+capabilities = { label = "Top", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+
+[[proxy]]
+id = 2
+type = "button"
+name = "Bottom"
+capabilities = { label = "Bottom", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[property]]
+name = "Button 1 id"
+type = "string"
+tooltip = "Resource id of the first button"
+
+[[property]]
+name = "Button 2 id"
+type = "string"
+tooltip = "Resource id of the second button, if the module is in two-rocker mode"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"

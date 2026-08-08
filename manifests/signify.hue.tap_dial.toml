@@ -1,0 +1,78 @@
+[driver]
+id = "signify.hue.tap_dial"
+name = "Philips Hue Tap Dial Switch"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+parent = "signify.hue.bridge"
+
+# Four buttons and a dial. The dial is a fifth binding rather than a property of the others, because
+# the bridge publishes it as its own resource (`relative_rotary`) and because turning it is a
+# different intention from pressing anything — a rule that brightens on rotation should not be woken
+# by somebody pressing button 3.
+#
+# The buttons are numbered rather than named. Unlike a dimmer, nothing is printed on them: they are
+# scene buttons and what they mean is whatever the house is set up to do with them.
+
+[[proxy]]
+id = 1
+type = "button"
+name = "Button 1"
+primary = true
+capabilities = { label = "1", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+
+[[proxy]]
+id = 2
+type = "button"
+name = "Button 2"
+capabilities = { label = "2", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[proxy]]
+id = 3
+type = "button"
+name = "Button 3"
+capabilities = { label = "3", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[proxy]]
+id = 4
+type = "button"
+name = "Button 4"
+capabilities = { label = "4", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+
+[[proxy]]
+id = 5
+type = "button"
+name = "Dial"
+# A dial and nothing else: it does not click, so none of the press notifications are declared. The
+# resolved notification set for this binding is rotation, battery and reachability.
+capabilities = { is_rotary = true }
+
+[[property]]
+name = "Button 1 id"
+type = "string"
+tooltip = "Resource id of the first button"
+
+[[property]]
+name = "Button 2 id"
+type = "string"
+tooltip = "Resource id of the second button"
+
+[[property]]
+name = "Button 3 id"
+type = "string"
+tooltip = "Resource id of the third button"
+
+[[property]]
+name = "Button 4 id"
+type = "string"
+tooltip = "Resource id of the fourth button"
+
+[[property]]
+name = "Rotary id"
+type = "string"
+tooltip = "Resource id of the dial"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"

@@ -2,7 +2,7 @@
 id = "signify.hue.bridge"
 name = "Philips Hue Bridge"
 manufacturer = "Signify"
-version = "1.1.0"
+version = "1.2.0"
 runtime = "native"
 
 # The bridge is a device in its own right. It holds the address and the paired key once, and

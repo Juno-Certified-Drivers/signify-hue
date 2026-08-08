@@ -27,8 +27,68 @@
 use driver_sdk::*;
 use driver_sdk::{Value, json};
 
+mod button;
+mod catalog;
+mod sensor;
+
 #[derive(Default)]
 pub struct HueBulb;
+
+/// What a given device behind this bridge actually is.
+///
+/// One loaded module answers for all of them. Core tells `discover` and `setup` which manifest they
+/// are running as, but `on_bind`, `on_command` and `on_event` are not given a driver id — so the
+/// runtime half has to work it out, and the honest signal is which properties the installer's
+/// adoption actually set. A bulb has a `Light id` and a keypad does not; nothing else needs asking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The hub. Holds the address and key, owns the event stream, and is not in any room.
+    Bridge,
+    Bulb,
+    Motion,
+    /// A keypad, remote, wall module or dial.
+    Control,
+}
+
+impl Role {
+    fn of(inst: &Instance) -> Role {
+        let has = |property: &str| inst.property(property).as_str().is_some_and(|s| !s.is_empty());
+        if has("Light id") {
+            Role::Bulb
+        } else if has("Motion id") {
+            Role::Motion
+        } else if has("Button 1 id") || has("Rotary id") {
+            Role::Control
+        } else {
+            Role::Bridge
+        }
+    }
+
+    /// Every binding this device has, so all of them can be brought online at bind rather than
+    /// binding 1 alone. A multi-sensor whose temperature never came online reads as a broken probe.
+    fn bindings(self, inst: &Instance) -> Vec<LocalId> {
+        let set = |property: &str| inst.property(property).as_str().is_some_and(|s| !s.is_empty());
+        match self {
+            Role::Bridge | Role::Bulb => vec![1],
+            Role::Motion => [("Motion id", 1), ("Temperature id", 2), ("Light level id", 3)]
+                .iter()
+                .filter(|(p, _)| set(p))
+                .map(|(_, id)| *id)
+                .collect(),
+            Role::Control => [
+                ("Button 1 id", 1),
+                ("Button 2 id", 2),
+                ("Button 3 id", 3),
+                ("Button 4 id", 4),
+                ("Rotary id", 5),
+            ]
+            .iter()
+            .filter(|(p, _)| set(p))
+            .map(|(_, id)| *id)
+            .collect(),
+        }
+    }
+}
 
 /// Hue takes brightness as a percentage but treats 0 as "dimmest on", not off — so a level of
 /// 0 has to become `on: false` or the bulb sits at 1% instead of going out.
@@ -79,6 +139,22 @@ fn hs_to_xy(hue_deg: f64, sat_pct: f64) -> (f64, f64) {
     (big_x / sum, big_y / sum)
 }
 
+/// The collections the bridge reads once at start, so a controller that has just come up knows
+/// where the house stands without waiting for something to change.
+///
+/// `button` is deliberately not among them, and the omission is the interesting part. A button
+/// resource carries its *last* event, which on a bridge that has been up for a week is a press from
+/// last Tuesday — reading it at start would report that press as if it had just happened, and every
+/// rule attached to that button would fire on a controller restart. Lights, motion, temperature and
+/// battery are states and can be read; a press is an event and can only be listened for.
+const AT_START: &[&str] = &[
+    "light",
+    "motion",
+    "temperature",
+    "light_level",
+    "device_power",
+];
+
 impl HueBulb {
     fn request(inst: &Instance, body: Value) -> Option<HostCall> {
         let bridge = inst.property("Bridge address").as_str()?.to_string();
@@ -105,9 +181,6 @@ impl HueBulb {
     /// [{"type":"update","data":[{"id":"<rid>","type":"light","dimming":{"brightness":42}}]}]
     /// ```
     fn on_stream(&self, inst: &mut Instance, args: &Args) -> Vec<HostCall> {
-        let Some(mine) = inst.property("Light id").as_str().map(str::to_string) else {
-            return Vec::new(); // the bridge itself, hearing its own stream
-        };
         let Some(text) = args.get("data").and_then(Value::as_str) else {
             return Vec::new();
         };
@@ -118,13 +191,32 @@ impl HueBulb {
         let mut out = Vec::new();
         for update in frame.as_array().into_iter().flatten() {
             for resource in update.get("data").and_then(Value::as_array).into_iter().flatten() {
-                if resource.get("id").and_then(Value::as_str) != Some(mine.as_str()) {
-                    continue;
-                }
-                out.extend(Self::report(inst, resource));
+                out.extend(Self::mine(inst, resource));
             }
         }
         out
+    }
+
+    /// One CLIP v2 resource, handed to whichever half of this driver knows what it means.
+    ///
+    /// Empty for everything that is not about this device, which is most of every frame — the
+    /// bridge publishes the whole house on one connection and core hands each frame to all of it.
+    /// The dispatch is on the device's role rather than on the resource's `type`, because the
+    /// question being answered is "is this mine", and only the device knows which ids are its own.
+    fn mine(inst: &mut Instance, resource: &Value) -> Vec<HostCall> {
+        match Role::of(inst) {
+            Role::Bulb => {
+                let mine = inst.property("Light id").as_str().map(str::to_string);
+                match (mine, resource.get("id").and_then(Value::as_str)) {
+                    (Some(mine), Some(id)) if mine == id => Self::report(inst, resource),
+                    _ => Vec::new(),
+                }
+            }
+            Role::Motion => sensor::report(inst, resource),
+            Role::Control => button::report(inst, resource),
+            // The bridge hearing its own stream. Everything on it belongs to something behind it.
+            Role::Bridge => Vec::new(),
+        }
     }
 
     /// Turn a light resource — from a poll or from the stream, they are the same shape — into
@@ -300,20 +392,29 @@ impl DriverModule for HueBulb {
     /// Without this a freshly adopted light shows no state until someone commands it, which
     /// reads as broken — and it is: the bulb may well already be on.
     fn on_bind(&self, inst: &mut Instance) -> Vec<HostCall> {
-        let mut out = Vec::new();
-        let mut a = Args::new();
-        a.insert("online".into(), json!(true));
-        out.push(HostCall::notify(1, "online_changed", a));
+        let role = Role::of(inst);
 
-        // The bridge — no `Light id`, so this instance is the hub rather than a bulb — opens
-        // the event stream, once, for the whole house.
+        // Every binding, not just the first. A motion sensor is three of them and a Tap Dial five,
+        // and a binding that never said it was reachable is drawn as a device that is not there.
+        let mut out: Vec<HostCall> = role
+            .bindings(inst)
+            .into_iter()
+            .map(|binding| {
+                let mut a = Args::new();
+                a.insert("online".into(), json!(true));
+                HostCall::notify(binding, "online_changed", a)
+            })
+            .collect();
+
+        // The bridge — the one instance with no resource id of its own — opens the event stream,
+        // once, for the whole house.
         //
         // Nothing here is polled, and until this existed nothing was: a bulb changed in the
         // Hue app or at a wall switch never got back to Juno, because the only thing that ever
         // reported a level was this driver stating its own intent after a command. One
         // subscription is what Hue offers and all it wants — core hands every frame to the
         // bulbs behind this bridge, and each keeps the ones naming it.
-        if inst.property("Light id").as_str().is_none()
+        if role == Role::Bridge
             && let (Some(bridge), Some(key)) = (
                 inst.property("Bridge address").as_str(),
                 inst.property("Application key").as_str(),
@@ -331,23 +432,28 @@ impl DriverModule for HueBulb {
                 data: request.into_bytes(),
             });
 
-            // And one read of every light, so a freshly started controller knows where the
+            // And one read of each kind of state, so a freshly started controller knows where the
             // house stands without waiting for something to change.
             //
-            // One request, not one per bulb. This used to be the bulb's own job, which meant
-            // twenty-four simultaneous GETs at every start — the bridge answered some of them
-            // with 429 and the rest arrived as a burst it had no reason to be asked for. The
-            // collection endpoint returns all of them in one answer, and core hands a bridge's
-            // answer to the devices behind it, so each bulb still picks itself out.
-            out.push(HostCall::Http(
-                HttpRequest::new("GET", format!("https://{bridge}/clip/v2/resource/light"))
+            // One request per collection, not one per device. This used to be the bulb's own job,
+            // which meant twenty-four simultaneous GETs at every start — the bridge answered some
+            // of them with 429 and the rest arrived as a burst it had no reason to be asked for.
+            // The collection endpoints return everything in one answer each, and core hands a
+            // bridge's answer to the devices behind it, so each one still picks itself out.
+            for collection in AT_START {
+                out.push(HostCall::Http(
+                    HttpRequest::new(
+                        "GET",
+                        format!("https://{bridge}/clip/v2/resource/{collection}"),
+                    )
                     .header("hue-application-key", key),
-            ));
+                ));
+            }
             return out;
         }
 
-        // A bulb asks for nothing. Its state arrives with the bridge's read above, and every
-        // change after that arrives on the stream.
+        // Everything behind the bridge asks for nothing. Its state arrives with the reads above,
+        // and every change after that arrives on the stream.
         out
     }
 
@@ -369,11 +475,12 @@ impl DriverModule for HueBulb {
             return Vec::new();
         }
         // CLIP v2 answers `{"errors": [], "data": [ … ]}` — one entry for a single resource,
-        // every light for the collection. Core hands a bridge's answer to the devices behind
-        // it, so this is reached with the whole house in it and has to find its own line.
-        let Some(mine) = inst.property("Light id").as_str().map(str::to_string) else {
-            return Vec::new(); // the bridge, hearing its own answer
-        };
+        // everything of that type for a collection. Core hands a bridge's answer to the devices
+        // behind it, so this is reached with the whole house in it and has to find its own lines.
+        //
+        // Plural, because a motion sensor has three: one answer to the temperature read carries
+        // every sensor in the house, and the same pass serves all five collections the bridge asks
+        // for at start. Anything not naming this device produces nothing.
         let Some(data) = args
             .get("body")
             .and_then(|b| b.get("data"))
@@ -381,13 +488,11 @@ impl DriverModule for HueBulb {
         else {
             return Vec::new();
         };
-        let Some(light) = data
-            .iter()
-            .find(|l| l.get("id").and_then(Value::as_str) == Some(mine.as_str()))
-        else {
-            return Vec::new();
-        };
-        Self::report(inst, light)
+        let mut out = Vec::new();
+        for resource in data {
+            out.extend(Self::mine(inst, resource));
+        }
+        out
     }
 }
 
@@ -402,6 +507,11 @@ export_driver!(HueBulb);
 /// Where the flow is. Core carries this between calls; the driver stays stateless.
 fn phase(state: &Value) -> &str {
     state.get("phase").and_then(Value::as_str).unwrap_or("start")
+}
+
+/// "accessory" / "accessories", for a count that is only known at runtime.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "y" } else { "ies" }
 }
 
 fn field(name: &str, label: &str, help: &str) -> Field {
@@ -549,12 +659,12 @@ impl HueBulb {
                 SetupStep::Fetch {
                     request: HttpRequest::new(
                         "GET",
-                        format!("https://{addr}/clip/v2/resource/light"),
+                        format!("https://{addr}/clip/v2/resource/device"),
                     )
                     .header("hue-application-key", &key),
-                    note: "reading the light list".into(),
+                    note: "reading what is paired to the bridge".into(),
                 },
-                json!({ "phase": "lights", "address": addr, "key": key,
+                json!({ "phase": "devices", "address": addr, "key": key,
                         "browse": true, "parent": state.get("parent") }),
             );
         }
@@ -649,12 +759,12 @@ impl HueBulb {
                         SetupStep::Fetch {
                             request: HttpRequest::new(
                                 "GET",
-                                format!("https://{address}/clip/v2/resource/light"),
+                                format!("https://{address}/clip/v2/resource/device"),
                             )
                             .header("hue-application-key", key),
-                            note: "reading the light list".into(),
+                            note: "reading what is paired to the bridge".into(),
                         },
-                        json!({ "phase": "lights", "address": address, "key": key }),
+                        json!({ "phase": "devices", "address": address, "key": key }),
                     );
                 }
 
@@ -692,8 +802,78 @@ impl HueBulb {
                 )
             }
 
+            // Everything paired to the bridge that is not a bulb — sensors, dimmers, wall modules,
+            // dials. One request rather than one per resource type, because a device entry names
+            // its own services and so arrives already grouped by the thing it is part of.
+            "devices" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let found = catalog::compact(input.get("response"));
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
+                            format!("https://{address}/clip/v2/resource/button"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading the buttons".into(),
+                    },
+                    json!({
+                        "phase": "buttons",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
+            // Which button is which. The device entry lists a remote's buttons as an unordered set,
+            // and only the `/button` collection carries `metadata.control_id` — so without this
+            // step every rule in the house would be attached to an arbitrary button and the remote
+            // would look faulty.
+            "buttons" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut found: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                catalog::order_buttons(&mut found, input.get("response"));
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
+                            format!("https://{address}/clip/v2/resource/light"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading the light list".into(),
+                    },
+                    json!({
+                        "phase": "lights",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
             // The real bulbs, read off the bridge. CLIP v2 answers
             // `{"errors": [], "data": [ … ]}`, each entry carrying a UUID and its own state.
+            // The accessories gathered by the two steps above are offered alongside them, so
+            // somebody setting a bridge up picks everything once instead of going round three times.
             "lights" => {
                 let address = address.unwrap_or_default();
                 let key = state
@@ -718,19 +898,15 @@ impl HueBulb {
                     );
                 }
 
-                let Some(data) = response
+                // No lights is no longer a failure. A bridge with a motion sensor and a dimmer on it
+                // and no bulbs of its own is a real setup — somebody using Hue accessories to drive
+                // Lutron loads — and refusing it because one of the three collections came back
+                // empty would be refusing a house that works.
+                let data: Vec<Value> = response
                     .and_then(|r| r.get("data"))
                     .and_then(Value::as_array)
-                    .filter(|d| !d.is_empty())
-                else {
-                    return (
-                        SetupStep::Failed {
-                            reason: "the bridge reported no lights — are any paired to it?"
-                                .into(),
-                        },
-                        Value::Null,
-                    );
-                };
+                    .cloned()
+                    .unwrap_or_default();
 
                 let mut options: Vec<Candidate> = data
                     .iter()
@@ -774,12 +950,45 @@ impl HueBulb {
                     })
                     .collect();
                 options.sort_by(|a, b| a.label.cmp(&b.label));
+                let bulbs = options.len();
+
+                // The sensors and controls gathered two steps ago, already sorted among themselves.
+                let accessories = catalog::candidates(
+                    &state
+                        .get("catalog")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                    &address,
+                    &key,
+                );
+                let extras = accessories.len();
+                options.extend(accessories);
+
+                if options.is_empty() {
+                    return (
+                        SetupStep::Failed {
+                            reason: "the bridge reported nothing paired to it — add your lights \
+                                     and accessories in the Hue app first"
+                                .into(),
+                        },
+                        Value::Null,
+                    );
+                }
+
+                let title = match (bulbs, extras) {
+                    (b, 0) => format!("{b} light(s) on this bridge"),
+                    (0, e) => format!("{e} accessor{} on this bridge", plural(e)),
+                    (b, e) => format!("{b} light(s) and {e} accessor{} on this bridge", plural(e)),
+                };
 
                 (
                     SetupStep::Choose {
-                        title: format!("{} light(s) on this bridge", options.len()),
+                        title,
                         body: "Pick the ones to add. Anything the bridge cannot reach is \
-                               marked — a bulb switched off at the wall will say so."
+                               marked — a bulb switched off at the wall will say so. A remote or \
+                               a sensor is added as one device with a binding per button or \
+                               measurement, so a rule can trigger on exactly one of them."
                             .into(),
                         options,
                         multiple: true,
@@ -804,16 +1013,20 @@ impl HueBulb {
                     .and_then(|c| driver_sdk::serde_json::from_value(c.clone()).ok())
                     .unwrap_or_default();
 
-                // The bridge comes first and carries the connection; the bulbs carry only
-                // what makes them individual. Core adopts the parent, then attaches the rest.
-                // Browsing an existing bridge: only the bulbs are new.
+                // The bridge comes first and carries the connection; everything behind it carries
+                // only what makes it individual. Core adopts the parent, then attaches the rest.
+                // Browsing an existing bridge: only the children are new.
+                //
+                // Each candidate keeps the `driver_id` the step that built it chose. It used to be
+                // overwritten with the bulb driver here, which was harmless while bulbs were the
+                // only thing on offer and would now quietly turn every sensor and every keypad into
+                // a light that 404s on its first command.
                 if state.get("browse").and_then(Value::as_bool) == Some(true) {
                     let devices = chosen
                         .into_iter()
                         .map(|mut c| {
                             c.properties.remove("Bridge address");
                             c.properties.remove("Application key");
-                            c.driver_id = "signify.hue.bulb".into();
                             c
                         })
                         .collect();
@@ -834,14 +1047,13 @@ impl HueBulb {
                     ]
                     .into_iter()
                     .collect(),
-                    verified: format!("{} light(s) behind it", chosen.len()),
+                    verified: format!("{} device(s) behind it", chosen.len()),
                 }];
 
                 for mut c in chosen {
                     // Drop the inherited copies — the bridge holds them now.
                     c.properties.remove("Bridge address");
                     c.properties.remove("Application key");
-                    c.driver_id = "signify.hue.bulb".into();
                     devices.push(c);
                 }
                 (SetupStep::Done { devices }, Value::Null)
