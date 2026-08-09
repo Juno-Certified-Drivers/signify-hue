@@ -509,6 +509,62 @@ fn phase(state: &Value) -> &str {
     state.get("phase").and_then(Value::as_str).unwrap_or("start")
 }
 
+/// Finish, asking first whether the bridge's scenes should come too.
+///
+/// Asked rather than assumed, because Signify creates four or five in every room whether anybody
+/// wanted them or not, and a house that gained sixty scenes by adopting a bridge would be a mess
+/// somebody has to clean up by hand. The ones that survive this far already touch a light that was
+/// actually picked, so the question is only ever about scenes that would work.
+///
+/// Skipped entirely when there are none, which is most bridges browsed for a single bulb — a
+/// screen that only ever has one answer is a screen not worth showing.
+fn ask_about_scenes(
+    devices: Vec<Candidate>,
+    rules: Vec<ImportedRule>,
+    scenes: Vec<ImportedScene>,
+) -> (SetupStep, Value) {
+    if scenes.is_empty() {
+        return (
+            SetupStep::Done {
+                devices,
+                rules,
+                scenes,
+            },
+            Value::Null,
+        );
+    }
+
+    let names: Vec<&str> = scenes.iter().take(4).map(|s| s.title.as_str()).collect();
+    let n = scenes.len();
+    (
+        SetupStep::Form {
+            title: format!("Bring over {n} scene{}?", if n == 1 { "" } else { "s" }),
+            body: format!(
+                "The bridge has {n} saved — {}{}. Each is a set of levels and colours, one per \
+                 light, and they come over exactly as they are. Skipping this changes nothing \
+                 else; the lights and remotes are added either way.",
+                names.join(", "),
+                if n > names.len() { " and others" } else { "" }
+            ),
+            fields: vec![Field {
+                name: "scenes".into(),
+                label: "Scenes".into(),
+                kind: "choice".into(),
+                help: String::new(),
+                default: Some(json!("Bring them over")),
+                options: vec!["Bring them over".into(), "Leave them".into()],
+                required: true,
+            }],
+        },
+        json!({
+            "phase": "scene_choice",
+            "devices": devices,
+            "rules": rules,
+            "scenes": scenes,
+        }),
+    )
+}
+
 /// "accessory" / "accessories", for a count that is only known at runtime.
 fn plural(n: usize) -> &'static str {
     if n == 1 { "y" } else { "ies" }
@@ -936,6 +992,39 @@ impl HueBulb {
                     SetupStep::Fetch {
                         request: HttpRequest::new(
                             "GET",
+                            format!("https://{address}/clip/v2/resource/scene"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading the scenes".into(),
+                    },
+                    json!({
+                        "phase": "hue_scenes",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "rooms": names,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
+            // The bridge's own scenes, kept raw until it is known which bulbs were picked.
+            //
+            // A scene is a list of light services and what each should be doing, and a light
+            // service only becomes something a scene can name once somebody has adopted it — so
+            // this cannot be reduced yet, only carried.
+            "hue_scenes" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
                             format!("https://{address}/clip/v2/resource/light"),
                         )
                         .header("hue-application-key", &key),
@@ -945,7 +1034,9 @@ impl HueBulb {
                         "phase": "lights",
                         "address": address,
                         "key": key,
-                        "catalog": found,
+                        "catalog": state.get("catalog"),
+                        "rooms": state.get("rooms"),
+                        "hue_scenes": input.get("response"),
                         "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
                         "parent": state.get("parent"),
                     }),
@@ -1082,6 +1173,9 @@ impl HueBulb {
                         "phase": "chosen",
                         "address": address,
                         "key": key,
+                        "catalog": state.get("catalog"),
+                        "rooms": state.get("rooms"),
+                        "hue_scenes": state.get("hue_scenes"),
                         // Carried through, or the last step forgets it is browsing and
                         // offers a second copy of a bridge that is already set up.
                         "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
@@ -1116,7 +1210,12 @@ impl HueBulb {
 
                 if state.get("browse").and_then(Value::as_bool) == Some(true) {
                     let rules = catalog::rules(&catalog, &chosen);
-                    let devices = chosen
+                    let scenes = catalog::scenes(
+                        state.get("hue_scenes"),
+                        state.get("rooms").unwrap_or(&Value::Null),
+                        &chosen,
+                    );
+                    let devices: Vec<Candidate> = chosen
                         .into_iter()
                         .map(|mut c| {
                             c.properties.remove("Bridge address");
@@ -1124,7 +1223,7 @@ impl HueBulb {
                             c
                         })
                         .collect();
-                    return (SetupStep::Done { devices, rules }, Value::Null);
+                    return ask_about_scenes(devices, rules, scenes);
                 }
 
                 let mut devices = vec![Candidate {
@@ -1158,7 +1257,46 @@ impl HueBulb {
                     devices.push(c);
                 }
                 let rules = catalog::rules(&catalog, &devices);
-                (SetupStep::Done { devices, rules }, Value::Null)
+                let scenes = catalog::scenes(
+                    state.get("hue_scenes"),
+                    state.get("rooms").unwrap_or(&Value::Null),
+                    &devices,
+                );
+                ask_about_scenes(devices, rules, scenes)
+            }
+
+            // The answer to that question.
+            "scene_choice" => {
+                let take = input
+                    .get("scenes")
+                    .and_then(Value::as_str)
+                    .is_some_and(|a| a.starts_with("Bring"));
+                let devices: Vec<Candidate> = state
+                    .get("devices")
+                    .cloned()
+                    .and_then(|v| driver_sdk::serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let rules: Vec<ImportedRule> = state
+                    .get("rules")
+                    .cloned()
+                    .and_then(|v| driver_sdk::serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let scenes: Vec<ImportedScene> = match take {
+                    false => Vec::new(),
+                    true => state
+                        .get("scenes")
+                        .cloned()
+                        .and_then(|v| driver_sdk::serde_json::from_value(v).ok())
+                        .unwrap_or_default(),
+                };
+                (
+                    SetupStep::Done {
+                        devices,
+                        rules,
+                        scenes,
+                    },
+                    Value::Null,
+                )
             }
 
             other => (

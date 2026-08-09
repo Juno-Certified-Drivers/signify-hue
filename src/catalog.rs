@@ -12,7 +12,7 @@
 //! printed. Getting this wrong is not subtle: every rule in the house would be attached to the wrong
 //! button, and it would look like the remote was faulty.
 
-use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, Value, json};
+use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, ImportedScene, Value, json};
 use std::collections::BTreeMap;
 
 /// Every keypad is one binding, keys and dial alike. See `keypad.toml`.
@@ -607,6 +607,101 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
     out
 }
 
+/// The bridge's own named arrangements, as scenes this house could have.
+///
+/// A Hue scene is the one thing on a bridge that is pure detail: five lights, each with a
+/// brightness and often a colour temperature, decided by somebody sitting in the room. Every other
+/// thing here can be described again in a sentence; this cannot, which is exactly why it is worth
+/// carrying across.
+///
+/// Only the lights that were actually adopted contribute. A half-imported "Relax" is a reasonable
+/// thing to end up with — the room has fewer lights in Juno than in Hue, and the arrangement of
+/// the ones it has is still the arrangement.
+///
+/// Scenes with no adopted lights at all vanish, which is the common case for the four or five
+/// Signify creates in every room whether anybody wanted them or not.
+pub fn scenes(
+    response: Option<&Value>,
+    room_names: &Value,
+    offered: &[Candidate],
+) -> Vec<ImportedScene> {
+    let Some(data) = response
+        .and_then(|r| r.get("data"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    // Light service rid -> which offered device it became.
+    let light_at = |rid: &str| {
+        offered
+            .iter()
+            .position(|c| c.properties.get("Light id").and_then(Value::as_str) == Some(rid))
+    };
+
+    data.iter()
+        .filter_map(|scene| {
+            let title = scene.pointer("/metadata/name")?.as_str()?.to_string();
+            let room = scene
+                .pointer("/group/rid")
+                .and_then(Value::as_str)
+                .and_then(|rid| room_names.get(rid))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            let mut steps = Vec::new();
+            for action in scene.get("actions").and_then(Value::as_array)? {
+                let Some(index) = action
+                    .pointer("/target/rid")
+                    .and_then(Value::as_str)
+                    .and_then(light_at)
+                else {
+                    continue;
+                };
+                let body = action.get("action")?;
+                let on = body.pointer("/on/on").and_then(Value::as_bool).unwrap_or(true);
+                let brightness = body.pointer("/dimming/brightness").and_then(Value::as_f64);
+
+                // Off is a level of nothing rather than an `off`, so one step per light says the
+                // whole of what that light should be doing — and a scene stays a list of levels.
+                let level = match (on, brightness) {
+                    (false, _) => 0.0,
+                    (true, Some(b)) => b.round().clamp(1.0, 100.0),
+                    (true, None) => 100.0,
+                };
+                steps.push(ImportedAction::Device {
+                    device: index,
+                    proxy: 1,
+                    command: "set_level".into(),
+                    args: [("level".to_string(), json!(level as u64))]
+                        .into_iter()
+                        .collect(),
+                });
+
+                // Colour temperature, where the scene sets one and the bulb is off no longer.
+                if on
+                    && let Some(mirek) = body
+                        .pointer("/color_temperature/mirek")
+                        .and_then(Value::as_u64)
+                        .filter(|m| *m > 0)
+                {
+                    steps.push(ImportedAction::Device {
+                        device: index,
+                        proxy: 1,
+                        command: "set_cct".into(),
+                        args: [("kelvin".to_string(), json!(1_000_000 / mirek))]
+                            .into_iter()
+                            .collect(),
+                    });
+                }
+            }
+
+            (!steps.is_empty()).then_some(ImportedScene { title, room, steps })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +824,95 @@ mod tests {
             made.iter().all(|r| r.label.starts_with("Hall dimmer — ")),
             "each rule says which remote it came off"
         );
+    }
+
+    /// A Hue scene comes over as the levels and colours it actually is.
+    ///
+    /// The detail is the whole value: "Relax" is not a room at 40%, it is one lamp warm and low
+    /// and another off, and that is a thing nobody would reconstruct from a description.
+    #[test]
+    fn a_scene_becomes_a_level_and_a_colour_per_light() {
+        let offered = vec![
+            Candidate {
+                label: "Lamp".into(),
+                properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+                ..Default::default()
+            },
+            Candidate {
+                label: "Downlight".into(),
+                properties: [("Light id".to_string(), json!("l2"))].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let rooms = json!({ "room-1": "Lounge" });
+        let response = json!({ "data": [{
+            "metadata": { "name": "Relax" },
+            "group": { "rid": "room-1", "rtype": "room" },
+            "actions": [
+                { "target": { "rid": "l1", "rtype": "light" },
+                  "action": { "on": { "on": true }, "dimming": { "brightness": 40.0 },
+                              "color_temperature": { "mirek": 454 } } },
+                // Off, which is a level of nothing rather than a separate command — one step per
+                // light says the whole of what that light should be doing.
+                { "target": { "rid": "l2", "rtype": "light" },
+                  "action": { "on": { "on": false } } },
+                // A bulb nobody adopted. The scene still comes over without it.
+                { "target": { "rid": "gone", "rtype": "light" },
+                  "action": { "on": { "on": true } } },
+            ],
+        }]});
+
+        let made = scenes(Some(&response), &rooms, &offered);
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].title, "Relax");
+        assert_eq!(made[0].room, "Lounge");
+
+        let steps: Vec<(usize, String, Value)> = made[0]
+            .steps
+            .iter()
+            .map(|s| match s {
+                ImportedAction::Device {
+                    device,
+                    command,
+                    args,
+                    ..
+                } => (
+                    *device,
+                    command.clone(),
+                    args.values().next().cloned().unwrap_or(Value::Null),
+                ),
+                _ => (999, "?".into(), Value::Null),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (0, "set_level".to_string(), json!(40)),
+                // 1_000_000 / 454 mirek is 2202 K, the warm end of a Hue bulb.
+                (0, "set_cct".to_string(), json!(2202)),
+                (1, "set_level".to_string(), json!(0)),
+            ]
+        );
+    }
+
+    /// A scene touching nothing that was adopted is not offered at all.
+    ///
+    /// Signify creates four or five in every room whether anybody wanted them or not, so the ones
+    /// that survive this are the ones that would actually do something.
+    #[test]
+    fn a_scene_with_no_adopted_lights_is_dropped() {
+        let offered = vec![Candidate {
+            label: "Lamp".into(),
+            properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+            ..Default::default()
+        }];
+        let response = json!({ "data": [{
+            "metadata": { "name": "Energize" },
+            "group": { "rid": "room-9", "rtype": "room" },
+            "actions": [{ "target": { "rid": "somebody-elses", "rtype": "light" },
+                          "action": { "on": { "on": true } } }],
+        }]});
+        assert!(scenes(Some(&response), &json!({}), &offered).is_empty());
     }
 
     /// A switch the bridge drives nothing with produces no rules to guess at.
