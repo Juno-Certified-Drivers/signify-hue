@@ -15,6 +15,9 @@
 use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, Value, json};
 use std::collections::BTreeMap;
 
+/// Every keypad is one binding, keys and dial alike. See `keypad.toml`.
+const KEYPAD: u32 = 1;
+
 /// A device worth offering, reduced to what the manifests need.
 ///
 /// Kept small deliberately: this travels in the setup state, which core carries between every step
@@ -537,11 +540,15 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
         let press = vec!["clicked".to_string()];
         let press_or_hold = vec!["clicked".to_string(), "repeating".to_string()];
 
-        let mut rule = |suffix: &str, proxy: u32, events: &[String], command: &str| {
+        // The whole remote is one binding, so every rule names proxy 1 and says which key it
+        // means in `when_params`. That is the same fact the old four-binding shape carried in the
+        // proxy id, said in the place a trigger can now read it.
+        let mut rule = |suffix: &str, key: u64, events: &[String], command: &str| {
             out.push(ImportedRule {
                 label: format!("{name} — {suffix}"),
                 when_device: index,
-                when_proxy: proxy,
+                when_proxy: KEYPAD,
+                when_params: [("key".to_string(), json!(key))].into_iter().collect(),
                 when_events: events.to_vec(),
                 then: on(command),
                 ..Default::default()
@@ -559,12 +566,15 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
                 then: on("all_lights_on"),
                 ..Default::default()
             }),
-            // A Tap Dial: only the ring is unambiguous. Its four buttons recall scenes.
+            // A Tap Dial: only the ring is unambiguous. Its four keys recall scenes.
+            //
+            // The ring reports on the same binding as the keys and carries no key of its own, so
+            // these two name no parameter — the notification is what tells them apart.
             (_, true) => {
                 out.push(ImportedRule {
                     label: format!("{name} — turn right"),
                     when_device: index,
-                    when_proxy: 5,
+                    when_proxy: KEYPAD,
                     when_events: vec!["rotated_clockwise".into()],
                     then: on("dim_up"),
                     ..Default::default()
@@ -572,7 +582,7 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
                 out.push(ImportedRule {
                     label: format!("{name} — turn left"),
                     when_device: index,
-                    when_proxy: 5,
+                    when_proxy: KEYPAD,
                     when_events: vec!["rotated_counter_clockwise".into()],
                     then: on("dim_down"),
                     ..Default::default()
@@ -686,24 +696,33 @@ mod tests {
         let offered = candidates(&catalog, "10.0.0.2", "key");
         let made = rules(&catalog, &offered);
 
-        let summary: Vec<(u32, Vec<String>, String)> = made
+        // Which key is a parameter now, not a binding. All four rules name the one keypad.
+        let summary: Vec<(Value, Vec<String>, String)> = made
             .iter()
             .map(|r| {
                 let command = match &r.then[0] {
                     ImportedAction::Room { command, .. } => command.clone(),
                     _ => "?".into(),
                 };
-                (r.when_proxy, r.when_events.clone(), command)
+                (
+                    r.when_params.get("key").cloned().unwrap_or(Value::Null),
+                    r.when_events.clone(),
+                    command,
+                )
             })
             .collect();
         assert_eq!(
             summary,
             vec![
-                (1, vec!["clicked".into()], "all_lights_on".to_string()),
-                (2, vec!["clicked".into(), "repeating".into()], "dim_up".into()),
-                (3, vec!["clicked".into(), "repeating".into()], "dim_down".into()),
-                (4, vec!["clicked".into()], "all_lights_off".into()),
+                (json!(1), vec!["clicked".into()], "all_lights_on".to_string()),
+                (json!(2), vec!["clicked".into(), "repeating".into()], "dim_up".into()),
+                (json!(3), vec!["clicked".into(), "repeating".into()], "dim_down".into()),
+                (json!(4), vec!["clicked".into()], "all_lights_off".into()),
             ]
+        );
+        assert!(
+            made.iter().all(|r| r.when_proxy == KEYPAD),
+            "a remote is one binding; the key is what tells the rules apart"
         );
         assert!(made.iter().all(|r| r.when_device == 0));
         assert!(
