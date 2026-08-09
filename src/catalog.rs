@@ -420,11 +420,11 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
             }
             out.push(Candidate {
                 label: name.clone(),
-                kind: if rid("rotary").is_some() {
-                    "dial".into()
-                } else {
-                    "switch".into()
-                },
+                // The proxy it will be bound to, not the shape of the plastic. "switch" is
+                // taken — in Juno it is a light that does not dim — so a dimmer switch
+                // tagged with it reads as a lamp. Which of these has a dial is in the
+                // product name and the properties; the tag says what it becomes.
+                kind: "keypad".into(),
                 driver_id: driver_id.into(),
                 properties: properties.clone(),
                 verified,
@@ -981,6 +981,9 @@ mod tests {
             "and says so in the list: {}",
             offered[0].verified
         );
+        // Never "switch": that is a light that does not dim, and the setup list shows this
+        // string to somebody deciding what to tick.
+        assert_eq!(offered[0].kind, "keypad");
     }
 
     #[test]
@@ -1044,5 +1047,8 @@ mod tests {
         assert_eq!(found[0].driver_id, "signify.hue.tap_dial");
         assert_eq!(found[0].properties["Rotary id"], json!("r1"));
         assert_eq!(found[0].properties["Button 4 id"], json!("b4"));
+        // A dial is a keypad that also turns. The driver tells them apart; the list does not
+        // need a kind of its own to say so.
+        assert_eq!(found[0].kind, "keypad");
     }
 }
