@@ -17,15 +17,20 @@ use driver_sdk::{Args, HostCall, Instance, LocalId, Value, json};
 /// Five entries covers everything Signify ships: four buttons on a dimmer or a Tap Dial, two on a
 /// wall module, one on a smart button. A device only carries the properties it has, and an unset
 /// property matches nothing, so the same table serves all four manifests.
-const BUTTONS: &[(&str, LocalId)] = &[
+/// Which key each control id is, numbered from 1 as the contract asks.
+///
+/// A key rather than a binding: the whole remote is one binding now, and which key was touched
+/// travels as a parameter. That is what lets a rule name one key without the device becoming
+/// four devices — see `keypad.toml`.
+const BUTTONS: &[(&str, u64)] = &[
     ("Button 1 id", 1),
     ("Button 2 id", 2),
     ("Button 3 id", 3),
     ("Button 4 id", 4),
 ];
 
-/// The dial, which is binding 5 on the one product that has one.
-const ROTARY: (&str, LocalId) = ("Rotary id", 5);
+/// Every keypad is one binding. The dial reports on it too.
+const KEYPAD: LocalId = 1;
 
 fn arg(key: &str, value: Value) -> Args {
     let mut a = Args::new();
@@ -79,26 +84,36 @@ pub fn report(inst: &Instance, resource: &Value) -> Vec<HostCall> {
         return Vec::new();
     };
 
-    for (property, binding) in BUTTONS {
+    for (property, key) in BUTTONS {
         if inst.property(property).as_str() != Some(id) {
             continue;
         }
         let Some(name) = event(resource).and_then(action) else {
             return Vec::new(); // an initial press, or a shape this firmware invented
         };
+        // `metadata.control_id` from /button is what makes key 1 the same key every time. It
+        // used to choose which of four bindings to emit on; it now fills the parameter, which is
+        // the same fact carried a shorter way.
         return vec![
-            HostCall::notify(*binding, name, Args::new()),
-            // The tile has nothing else to draw. A button is not on or off, and a keypad showing
-            // blank forever reads as one that is not working — this is how somebody can see it is.
+            HostCall::notify(KEYPAD, name, arg("key", json!(key))),
+            // The tile has nothing else to draw. A keypad is not on or off, and one showing blank
+            // for ever reads as a remote that is not working — this is how somebody sees it is.
+            //
+            // Named, because "held" on a four-key remote does not say which.
             HostCall::SetState {
-                proxy: *binding,
+                proxy: KEYPAD,
                 key: "last_action".into(),
-                value: json!(name),
+                // The number, not the label. `key_labels` is a capability on the contract, so
+                // the UI already knows this key is called "Brighter" — writing the name in here
+                // too would be a second copy to keep in step, and the one that goes stale when
+                // somebody renames it.
+                value: json!(format!("key {key} {name}")),
             },
         ];
     }
 
-    let (rotary_property, rotary_binding) = ROTARY;
+    // The dial reports on the same binding as the keys; only the notification differs.
+    let rotary_property = "Rotary id";
     if inst.property(rotary_property).as_str() == Some(id) {
         let Some((direction, steps)) = rotation(resource) else {
             return Vec::new();
@@ -112,9 +127,9 @@ pub fn report(inst: &Instance, resource: &Value) -> Vec<HostCall> {
             "rotated_counter_clockwise"
         };
         return vec![
-            HostCall::notify(rotary_binding, name, arg("steps", json!(steps))),
+            HostCall::notify(KEYPAD, name, arg("steps", json!(steps))),
             HostCall::SetState {
-                proxy: rotary_binding,
+                proxy: KEYPAD,
                 key: "last_action".into(),
                 value: json!(name),
             },

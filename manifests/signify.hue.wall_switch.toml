@@ -18,18 +18,19 @@ parent = "signify.hue.bridge"
 # wired to whatever it was always wired to, and Hue's own bulbs behind it stay permanently powered.
 # So this is a `button`, not a `switch`, and there is nothing here to turn on.
 
-[[proxy]]
-id = 1
-type = "button"
-name = "Top"
-primary = true
-capabilities = { label = "Top", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+# One binding for the whole remote, with the keys as parameters.
+#
+# A rule matches `pressed { key = 2, action = "held" }`, so "when the hall dimmer's brighter key
+# is held" is expressible on one binding — which it was not before core's triggers could match
+# parameters, and which is why this contract used to be one binding per key. A remote is one
+# object somebody picks up; four bindings made it four tiles and four things to go offline
+# separately.
 
 [[proxy]]
-id = 2
-type = "button"
-name = "Bottom"
-capabilities = { label = "Bottom", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
+id = 1
+type = "keypad"
+primary = true
+capabilities = { key_count = 2, key_labels = "Left,Right", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
 
 [[property]]
 name = "Button 1 id"

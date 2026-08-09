@@ -14,38 +14,19 @@ parent = "signify.hue.bridge"
 # The buttons are numbered rather than named. Unlike a dimmer, nothing is printed on them: they are
 # scene buttons and what they mean is whatever the house is set up to do with them.
 
+# One binding for the whole remote, with the keys as parameters.
+#
+# A rule matches `pressed { key = 2, action = "held" }`, so "when the hall dimmer's brighter key
+# is held" is expressible on one binding — which it was not before core's triggers could match
+# parameters, and which is why this contract used to be one binding per key. A remote is one
+# object somebody picks up; four bindings made it four tiles and four things to go offline
+# separately.
+
 [[proxy]]
 id = 1
-type = "button"
-name = "Button 1"
+type = "keypad"
 primary = true
-capabilities = { label = "1", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
-
-[[proxy]]
-id = 2
-type = "button"
-name = "Button 2"
-capabilities = { label = "2", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
-
-[[proxy]]
-id = 3
-type = "button"
-name = "Button 3"
-capabilities = { label = "3", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
-
-[[proxy]]
-id = 4
-type = "button"
-name = "Button 4"
-capabilities = { label = "4", has_hold = true, has_repeat = true, has_double = true, has_triple = true }
-
-[[proxy]]
-id = 5
-type = "button"
-name = "Dial"
-# A dial and nothing else: it does not click, so none of the press notifications are declared. The
-# resolved notification set for this binding is rotation, battery and reachability.
-capabilities = { is_rotary = true }
+capabilities = { key_count = 4, key_labels = "Button 1,Button 2,Button 3,Button 4", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true, is_rotary = true }
 
 [[property]]
 name = "Button 1 id"

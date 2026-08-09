@@ -6,16 +6,20 @@ version = "1.2.0"
 runtime = "native"
 parent = "signify.hue.bridge"
 
-# One button, one binding. The simplest thing this driver installs, and the one that shows most
-# plainly what a `button` proxy is: it has no state to speak of, takes no commands, and exists
-# entirely so that a rule has something to trigger on.
+
+# One binding for the whole remote, with the keys as parameters.
+#
+# A rule matches `pressed { key = 2, action = "held" }`, so "when the hall dimmer's brighter key
+# is held" is expressible on one binding — which it was not before core's triggers could match
+# parameters, and which is why this contract used to be one binding per key. A remote is one
+# object somebody picks up; four bindings made it four tiles and four things to go offline
+# separately.
 
 [[proxy]]
 id = 1
-type = "button"
-name = "Button"
+type = "keypad"
 primary = true
-capabilities = { has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+capabilities = { key_count = 1, key_labels = "Button", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
 
 [[property]]
 name = "Button 1 id"
