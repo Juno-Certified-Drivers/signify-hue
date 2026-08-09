@@ -620,11 +620,7 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
 ///
 /// Scenes with no adopted lights at all vanish, which is the common case for the four or five
 /// Signify creates in every room whether anybody wanted them or not.
-pub fn scenes(
-    response: Option<&Value>,
-    room_names: &Value,
-    offered: &[Candidate],
-) -> Vec<ImportedScene> {
+pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedScene> {
     let Some(data) = response
         .and_then(|r| r.get("data"))
         .and_then(Value::as_array)
@@ -642,13 +638,16 @@ pub fn scenes(
     data.iter()
         .filter_map(|scene| {
             let title = scene.pointer("/metadata/name")?.as_str()?.to_string();
-            let room = scene
-                .pointer("/group/rid")
-                .and_then(Value::as_str)
-                .and_then(|rid| room_names.get(rid))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+
+            // The rooms are read off the lights the scene touches, not off the group it names.
+            //
+            // Better than following `group`, and simpler. A Hue scene can belong to a *zone*, and
+            // a zone is exactly the thing that does not follow walls — an open-plan kitchen,
+            // dining room and living room, or "Downstairs". Resolving the group would need the
+            // zone list and would then have to work out which rooms a zone spans, which is what
+            // its lights already say. This gets zone scenes right without asking the bridge
+            // anything more, and gets room scenes right for the same reason.
+            let mut rooms: Vec<String> = Vec::new();
 
             let mut steps = Vec::new();
             for action in scene.get("actions").and_then(Value::as_array)? {
@@ -659,6 +658,16 @@ pub fn scenes(
                 else {
                     continue;
                 };
+                // Where that light is. A scene over an open plan collects two or three this way,
+                // which is the honest answer to which rooms it covers.
+                if let Some(room) = offered
+                    .get(index)
+                    .map(|c| c.room.clone())
+                    .filter(|r| !r.is_empty())
+                    && !rooms.contains(&room)
+                {
+                    rooms.push(room);
+                }
                 let body = action.get("action")?;
                 let on = body.pointer("/on/on").and_then(Value::as_bool).unwrap_or(true);
                 let brightness = body.pointer("/dimming/brightness").and_then(Value::as_f64);
@@ -697,7 +706,11 @@ pub fn scenes(
                 }
             }
 
-            (!steps.is_empty()).then_some(ImportedScene { title, room, steps })
+            (!steps.is_empty()).then_some(ImportedScene {
+                title,
+                rooms,
+                steps,
+            })
         })
         .collect()
 }
@@ -832,19 +845,22 @@ mod tests {
     /// and another off, and that is a thing nobody would reconstruct from a description.
     #[test]
     fn a_scene_becomes_a_level_and_a_colour_per_light() {
+        // Two lights in two different rooms — an open plan, as far as the bridge is concerned
+        // a zone, and as far as anybody standing there is concerned one space.
         let offered = vec![
             Candidate {
                 label: "Lamp".into(),
+                room: "Lounge".into(),
                 properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
                 ..Default::default()
             },
             Candidate {
                 label: "Downlight".into(),
+                room: "Kitchen".into(),
                 properties: [("Light id".to_string(), json!("l2"))].into_iter().collect(),
                 ..Default::default()
             },
         ];
-        let rooms = json!({ "room-1": "Lounge" });
         let response = json!({ "data": [{
             "metadata": { "name": "Relax" },
             "group": { "rid": "room-1", "rtype": "room" },
@@ -862,10 +878,12 @@ mod tests {
             ],
         }]});
 
-        let made = scenes(Some(&response), &rooms, &offered);
+        let made = scenes(Some(&response), &offered);
         assert_eq!(made.len(), 1);
         assert_eq!(made[0].title, "Relax");
-        assert_eq!(made[0].room, "Lounge");
+        // Read off the lights it touches rather than the group it names, which is what makes a
+        // zone scene land on the rooms it actually covers without asking the bridge for zones.
+        assert_eq!(made[0].rooms, vec!["Lounge".to_string(), "Kitchen".to_string()]);
 
         let steps: Vec<(usize, String, Value)> = made[0]
             .steps
@@ -912,7 +930,7 @@ mod tests {
             "actions": [{ "target": { "rid": "somebody-elses", "rtype": "light" },
                           "action": { "on": { "on": true } } }],
         }]});
-        assert!(scenes(Some(&response), &json!({}), &offered).is_empty());
+        assert!(scenes(Some(&response), &offered).is_empty());
     }
 
     /// A switch the bridge drives nothing with produces no rules to guess at.

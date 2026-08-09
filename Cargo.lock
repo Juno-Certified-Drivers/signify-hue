@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "driver-sdk"
 version = "0.9.1"
-source = "git+https://github.com/junohouse/driver-sdk?branch=add-button-proxy#f3485fb044115d6f5eb0d21fa86e8c2c2f18e5c8"
+source = "git+https://github.com/junohouse/driver-sdk?branch=add-button-proxy#8ac858b70cffc60ba5c2cdee793b2a16191db8d4"
 dependencies = [
  "serde",
  "serde_json",

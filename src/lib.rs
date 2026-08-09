@@ -1210,11 +1210,7 @@ impl HueBulb {
 
                 if state.get("browse").and_then(Value::as_bool) == Some(true) {
                     let rules = catalog::rules(&catalog, &chosen);
-                    let scenes = catalog::scenes(
-                        state.get("hue_scenes"),
-                        state.get("rooms").unwrap_or(&Value::Null),
-                        &chosen,
-                    );
+                    let scenes = catalog::scenes(state.get("hue_scenes"), &chosen);
                     let devices: Vec<Candidate> = chosen
                         .into_iter()
                         .map(|mut c| {
@@ -1257,11 +1253,7 @@ impl HueBulb {
                     devices.push(c);
                 }
                 let rules = catalog::rules(&catalog, &devices);
-                let scenes = catalog::scenes(
-                    state.get("hue_scenes"),
-                    state.get("rooms").unwrap_or(&Value::Null),
-                    &devices,
-                );
+                let scenes = catalog::scenes(state.get("hue_scenes"), &devices);
                 ask_about_scenes(devices, rules, scenes)
             }
 
