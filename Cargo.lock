@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "driver-sdk"
 version = "0.7.0"
-source = "git+https://github.com/junohouse/driver-sdk?tag=v0.7.0#7674508cbff4a5f9f663806c2f80a85572283236"
+source = "git+https://github.com/junohouse/driver-sdk?branch=add-button-proxy#637b971b3a188e8f2ea2348387846921d2e9d75e"
 dependencies = [
  "serde",
  "serde_json",
@@ -19,7 +19,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "juno-driver-hue"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "driver-sdk",
 ]

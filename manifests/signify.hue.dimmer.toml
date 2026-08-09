@@ -1,0 +1,47 @@
+[driver]
+id = "signify.hue.dimmer"
+name = "Philips Hue Dimmer Switch"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+parent = "signify.hue.bridge"
+
+
+# One binding for the whole remote, with the keys as parameters.
+#
+# A rule matches `pressed { key = 2, action = "held" }`, so "when the hall dimmer's brighter key
+# is held" is expressible on one binding — which it was not before core's triggers could match
+# parameters, and which is why this contract used to be one binding per key. A remote is one
+# object somebody picks up; four bindings made it four tiles and four things to go offline
+# separately.
+
+[[proxy]]
+id = 1
+type = "keypad"
+primary = true
+capabilities = { key_count = 4, key_labels = "On,Brighter,Dimmer,Off", has_hold = true, has_repeat = true, has_double = true, has_triple = true, has_battery = true }
+
+[[property]]
+name = "Button 1 id"
+type = "string"
+tooltip = "Resource id of the first button"
+
+[[property]]
+name = "Button 2 id"
+type = "string"
+tooltip = "Resource id of the second button"
+
+[[property]]
+name = "Button 3 id"
+type = "string"
+tooltip = "Resource id of the third button"
+
+[[property]]
+name = "Button 4 id"
+type = "string"
+tooltip = "Resource id of the fourth button"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"

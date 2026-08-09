@@ -1,0 +1,59 @@
+[driver]
+id = "signify.hue.motion"
+name = "Philips Hue Motion Sensor"
+manufacturer = "Signify"
+version = "1.2.0"
+runtime = "native"
+# Sensors live behind a bridge and inherit its address and key, exactly as bulbs do.
+parent = "signify.hue.bridge"
+
+# One Hue motion sensor is three measurements, so it is three bindings rather than one binding
+# carrying three numbers. That is the `sensor` contract's own rule, and the reason for it shows up
+# here: "when the hall is dark and somebody moves" is two triggers on two bindings, and there is no
+# way to write it against a single binding that reports motion, temperature and lux in turn.
+#
+# The temperature and light-level services are on the same physical device and the same battery, and
+# the bridge gives them their own resource ids — so nothing has to be split apart or inferred. The
+# driver stores one id per binding and matches event frames against them.
+
+[[proxy]]
+id = 1
+type = "sensor"
+name = "Motion"
+primary = true
+# `auto_clear_seconds = 0` is an answer, not an omission: a Hue sensor reports its own clear about
+# ten seconds after it stops seeing anything, so core must not run a timer of its own. Leaving it
+# unset would draw a lint finding asking exactly this question.
+capabilities = { kind = "motion", is_boolean = true, auto_clear_seconds = 0, has_battery = true }
+
+[[proxy]]
+id = 2
+type = "sensor"
+name = "Temperature"
+capabilities = { kind = "temperature", unit = "°C" }
+
+[[proxy]]
+id = 3
+type = "sensor"
+name = "Light level"
+capabilities = { kind = "lux", unit = "lx" }
+
+[[property]]
+name = "Motion id"
+type = "string"
+tooltip = "The motion service's resource id on the bridge"
+
+[[property]]
+name = "Temperature id"
+type = "string"
+tooltip = "The temperature service's resource id on the bridge"
+
+[[property]]
+name = "Light level id"
+type = "string"
+tooltip = "The light-level service's resource id on the bridge"
+
+[[property]]
+name = "Power id"
+type = "string"
+tooltip = "The battery service's resource id on the bridge"
