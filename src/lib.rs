@@ -1101,25 +1101,28 @@ impl HueBulb {
                             .unwrap_or("Hue light");
                         let on = light.pointer("/on/on").and_then(Value::as_bool);
                         // v2 omits `on` for a light the bridge cannot currently see.
-                        let verified = match on {
-                            Some(true) => "bridge reports it on".to_string(),
-                            Some(false) => "bridge reports it off".to_string(),
-                            None => "bridge cannot reach it — is it powered?".to_string(),
+                        let state = match on {
+                            Some(true) => "bridge reports it on",
+                            Some(false) => "bridge reports it off",
+                            None => "bridge cannot reach it — is it powered?",
                         };
                         // What the bulb can do decides which commands exist, so read it here
-                        // rather than assuming every Hue is a colour bulb.
-                        let kind = if light.get("color").is_some() {
-                            "colour light"
+                        // rather than assuming every Hue is a colour bulb. It belongs in
+                        // `verified` beside the rest of what the bridge said, not in `kind`:
+                        // a tunable white and a colour bulb are both a `light`, and putting
+                        // the difference in the kind splits one list of bulbs into three.
+                        let can = if light.get("color").is_some() {
+                            "colour"
                         } else if light.get("color_temperature").is_some() {
                             "tunable white"
                         } else if light.get("dimming").is_some() {
                             "dimmable"
                         } else {
-                            "light"
+                            "on/off"
                         };
                         Some(Candidate {
                             label: name.to_string(),
-                            kind: kind.to_string(),
+                            kind: "light".into(),
                             driver_id: "signify.hue.bulb".into(),
                             properties: [
                                 ("Bridge address".to_string(), json!(address)),
@@ -1128,7 +1131,7 @@ impl HueBulb {
                             ]
                             .into_iter()
                             .collect(),
-                            verified,
+                            verified: format!("{can} — {state}"),
                             room: catalog::room_of_light(&found, id).unwrap_or_default(),
                         })
                     })
