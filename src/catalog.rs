@@ -12,8 +12,11 @@
 //! printed. Getting this wrong is not subtle: every rule in the house would be attached to the wrong
 //! button, and it would look like the remote was faulty.
 
-use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, Value, json};
+use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, ImportedScene, Value, json};
 use std::collections::BTreeMap;
+
+/// Every keypad is one binding, keys and dial alike. See `keypad.toml`.
+const KEYPAD: u32 = 1;
 
 /// A device worth offering, reduced to what the manifests need.
 ///
@@ -417,11 +420,11 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
             }
             out.push(Candidate {
                 label: name.clone(),
-                kind: if rid("rotary").is_some() {
-                    "dial".into()
-                } else {
-                    "switch".into()
-                },
+                // The proxy it will be bound to, not the shape of the plastic. "switch" is
+                // taken — in Juno it is a light that does not dim — so a dimmer switch
+                // tagged with it reads as a lamp. Which of these has a dial is in the
+                // product name and the properties; the tag says what it becomes.
+                kind: "keypad".into(),
                 driver_id: driver_id.into(),
                 properties: properties.clone(),
                 verified,
@@ -537,11 +540,15 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
         let press = vec!["clicked".to_string()];
         let press_or_hold = vec!["clicked".to_string(), "repeating".to_string()];
 
-        let mut rule = |suffix: &str, proxy: u32, events: &[String], command: &str| {
+        // The whole remote is one binding, so every rule names proxy 1 and says which key it
+        // means in `when_params`. That is the same fact the old four-binding shape carried in the
+        // proxy id, said in the place a trigger can now read it.
+        let mut rule = |suffix: &str, key: u64, events: &[String], command: &str| {
             out.push(ImportedRule {
                 label: format!("{name} — {suffix}"),
                 when_device: index,
-                when_proxy: proxy,
+                when_proxy: KEYPAD,
+                when_params: [("key".to_string(), json!(key))].into_iter().collect(),
                 when_events: events.to_vec(),
                 then: on(command),
                 ..Default::default()
@@ -559,12 +566,15 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
                 then: on("all_lights_on"),
                 ..Default::default()
             }),
-            // A Tap Dial: only the ring is unambiguous. Its four buttons recall scenes.
+            // A Tap Dial: only the ring is unambiguous. Its four keys recall scenes.
+            //
+            // The ring reports on the same binding as the keys and carries no key of its own, so
+            // these two name no parameter — the notification is what tells them apart.
             (_, true) => {
                 out.push(ImportedRule {
                     label: format!("{name} — turn right"),
                     when_device: index,
-                    when_proxy: 5,
+                    when_proxy: KEYPAD,
                     when_events: vec!["rotated_clockwise".into()],
                     then: on("dim_up"),
                     ..Default::default()
@@ -572,7 +582,7 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
                 out.push(ImportedRule {
                     label: format!("{name} — turn left"),
                     when_device: index,
-                    when_proxy: 5,
+                    when_proxy: KEYPAD,
                     when_events: vec!["rotated_counter_clockwise".into()],
                     then: on("dim_down"),
                     ..Default::default()
@@ -595,6 +605,114 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
         }
     }
     out
+}
+
+/// The bridge's own named arrangements, as scenes this house could have.
+///
+/// A Hue scene is the one thing on a bridge that is pure detail: five lights, each with a
+/// brightness and often a colour temperature, decided by somebody sitting in the room. Every other
+/// thing here can be described again in a sentence; this cannot, which is exactly why it is worth
+/// carrying across.
+///
+/// Only the lights that were actually adopted contribute. A half-imported "Relax" is a reasonable
+/// thing to end up with — the room has fewer lights in Juno than in Hue, and the arrangement of
+/// the ones it has is still the arrangement.
+///
+/// Scenes with no adopted lights at all vanish, which is the common case for the four or five
+/// Signify creates in every room whether anybody wanted them or not.
+pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedScene> {
+    let Some(data) = response
+        .and_then(|r| r.get("data"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    // Light service rid -> which offered device it became.
+    let light_at = |rid: &str| {
+        offered
+            .iter()
+            .position(|c| c.properties.get("Light id").and_then(Value::as_str) == Some(rid))
+    };
+
+    data.iter()
+        .filter_map(|scene| {
+            let title = scene.pointer("/metadata/name")?.as_str()?.to_string();
+
+            // The rooms are read off the lights the scene touches, not off the group it names.
+            //
+            // Better than following `group`, and simpler. A Hue scene can belong to a *zone*, and
+            // a zone is exactly the thing that does not follow walls — an open-plan kitchen,
+            // dining room and living room, or "Downstairs". Resolving the group would need the
+            // zone list and would then have to work out which rooms a zone spans, which is what
+            // its lights already say. This gets zone scenes right without asking the bridge
+            // anything more, and gets room scenes right for the same reason.
+            let mut rooms: Vec<String> = Vec::new();
+
+            let mut steps = Vec::new();
+            for action in scene.get("actions").and_then(Value::as_array)? {
+                let Some(index) = action
+                    .pointer("/target/rid")
+                    .and_then(Value::as_str)
+                    .and_then(light_at)
+                else {
+                    continue;
+                };
+                // Where that light is. A scene over an open plan collects two or three this way,
+                // which is the honest answer to which rooms it covers.
+                if let Some(room) = offered
+                    .get(index)
+                    .map(|c| c.room.clone())
+                    .filter(|r| !r.is_empty())
+                    && !rooms.contains(&room)
+                {
+                    rooms.push(room);
+                }
+                let body = action.get("action")?;
+                let on = body.pointer("/on/on").and_then(Value::as_bool).unwrap_or(true);
+                let brightness = body.pointer("/dimming/brightness").and_then(Value::as_f64);
+
+                // Off is a level of nothing rather than an `off`, so one step per light says the
+                // whole of what that light should be doing — and a scene stays a list of levels.
+                let level = match (on, brightness) {
+                    (false, _) => 0.0,
+                    (true, Some(b)) => b.round().clamp(1.0, 100.0),
+                    (true, None) => 100.0,
+                };
+                steps.push(ImportedAction::Device {
+                    device: index,
+                    proxy: 1,
+                    command: "set_level".into(),
+                    args: [("level".to_string(), json!(level as u64))]
+                        .into_iter()
+                        .collect(),
+                });
+
+                // Colour temperature, where the scene sets one and the bulb is off no longer.
+                if on
+                    && let Some(mirek) = body
+                        .pointer("/color_temperature/mirek")
+                        .and_then(Value::as_u64)
+                        .filter(|m| *m > 0)
+                {
+                    steps.push(ImportedAction::Device {
+                        device: index,
+                        proxy: 1,
+                        command: "set_cct".into(),
+                        args: [("kelvin".to_string(), json!(1_000_000 / mirek))]
+                            .into_iter()
+                            .collect(),
+                    });
+                }
+            }
+
+            (!steps.is_empty()).then_some(ImportedScene {
+                title,
+                rooms,
+                steps,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -686,30 +804,133 @@ mod tests {
         let offered = candidates(&catalog, "10.0.0.2", "key");
         let made = rules(&catalog, &offered);
 
-        let summary: Vec<(u32, Vec<String>, String)> = made
+        // Which key is a parameter now, not a binding. All four rules name the one keypad.
+        let summary: Vec<(Value, Vec<String>, String)> = made
             .iter()
             .map(|r| {
                 let command = match &r.then[0] {
                     ImportedAction::Room { command, .. } => command.clone(),
                     _ => "?".into(),
                 };
-                (r.when_proxy, r.when_events.clone(), command)
+                (
+                    r.when_params.get("key").cloned().unwrap_or(Value::Null),
+                    r.when_events.clone(),
+                    command,
+                )
             })
             .collect();
         assert_eq!(
             summary,
             vec![
-                (1, vec!["clicked".into()], "all_lights_on".to_string()),
-                (2, vec!["clicked".into(), "repeating".into()], "dim_up".into()),
-                (3, vec!["clicked".into(), "repeating".into()], "dim_down".into()),
-                (4, vec!["clicked".into()], "all_lights_off".into()),
+                (json!(1), vec!["clicked".into()], "all_lights_on".to_string()),
+                (json!(2), vec!["clicked".into(), "repeating".into()], "dim_up".into()),
+                (json!(3), vec!["clicked".into(), "repeating".into()], "dim_down".into()),
+                (json!(4), vec!["clicked".into()], "all_lights_off".into()),
             ]
+        );
+        assert!(
+            made.iter().all(|r| r.when_proxy == KEYPAD),
+            "a remote is one binding; the key is what tells the rules apart"
         );
         assert!(made.iter().all(|r| r.when_device == 0));
         assert!(
             made.iter().all(|r| r.label.starts_with("Hall dimmer — ")),
             "each rule says which remote it came off"
         );
+    }
+
+    /// A Hue scene comes over as the levels and colours it actually is.
+    ///
+    /// The detail is the whole value: "Relax" is not a room at 40%, it is one lamp warm and low
+    /// and another off, and that is a thing nobody would reconstruct from a description.
+    #[test]
+    fn a_scene_becomes_a_level_and_a_colour_per_light() {
+        // Two lights in two different rooms — an open plan, as far as the bridge is concerned
+        // a zone, and as far as anybody standing there is concerned one space.
+        let offered = vec![
+            Candidate {
+                label: "Lamp".into(),
+                room: "Lounge".into(),
+                properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+                ..Default::default()
+            },
+            Candidate {
+                label: "Downlight".into(),
+                room: "Kitchen".into(),
+                properties: [("Light id".to_string(), json!("l2"))].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let response = json!({ "data": [{
+            "metadata": { "name": "Relax" },
+            "group": { "rid": "room-1", "rtype": "room" },
+            "actions": [
+                { "target": { "rid": "l1", "rtype": "light" },
+                  "action": { "on": { "on": true }, "dimming": { "brightness": 40.0 },
+                              "color_temperature": { "mirek": 454 } } },
+                // Off, which is a level of nothing rather than a separate command — one step per
+                // light says the whole of what that light should be doing.
+                { "target": { "rid": "l2", "rtype": "light" },
+                  "action": { "on": { "on": false } } },
+                // A bulb nobody adopted. The scene still comes over without it.
+                { "target": { "rid": "gone", "rtype": "light" },
+                  "action": { "on": { "on": true } } },
+            ],
+        }]});
+
+        let made = scenes(Some(&response), &offered);
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].title, "Relax");
+        // Read off the lights it touches rather than the group it names, which is what makes a
+        // zone scene land on the rooms it actually covers without asking the bridge for zones.
+        assert_eq!(made[0].rooms, vec!["Lounge".to_string(), "Kitchen".to_string()]);
+
+        let steps: Vec<(usize, String, Value)> = made[0]
+            .steps
+            .iter()
+            .map(|s| match s {
+                ImportedAction::Device {
+                    device,
+                    command,
+                    args,
+                    ..
+                } => (
+                    *device,
+                    command.clone(),
+                    args.values().next().cloned().unwrap_or(Value::Null),
+                ),
+                _ => (999, "?".into(), Value::Null),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (0, "set_level".to_string(), json!(40)),
+                // 1_000_000 / 454 mirek is 2202 K, the warm end of a Hue bulb.
+                (0, "set_cct".to_string(), json!(2202)),
+                (1, "set_level".to_string(), json!(0)),
+            ]
+        );
+    }
+
+    /// A scene touching nothing that was adopted is not offered at all.
+    ///
+    /// Signify creates four or five in every room whether anybody wanted them or not, so the ones
+    /// that survive this are the ones that would actually do something.
+    #[test]
+    fn a_scene_with_no_adopted_lights_is_dropped() {
+        let offered = vec![Candidate {
+            label: "Lamp".into(),
+            properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+            ..Default::default()
+        }];
+        let response = json!({ "data": [{
+            "metadata": { "name": "Energize" },
+            "group": { "rid": "room-9", "rtype": "room" },
+            "actions": [{ "target": { "rid": "somebody-elses", "rtype": "light" },
+                          "action": { "on": { "on": true } } }],
+        }]});
+        assert!(scenes(Some(&response), &offered).is_empty());
     }
 
     /// A switch the bridge drives nothing with produces no rules to guess at.
@@ -760,6 +981,9 @@ mod tests {
             "and says so in the list: {}",
             offered[0].verified
         );
+        // Never "switch": that is a light that does not dim, and the setup list shows this
+        // string to somebody deciding what to tick.
+        assert_eq!(offered[0].kind, "keypad");
     }
 
     #[test]
@@ -823,5 +1047,8 @@ mod tests {
         assert_eq!(found[0].driver_id, "signify.hue.tap_dial");
         assert_eq!(found[0].properties["Rotary id"], json!("r1"));
         assert_eq!(found[0].properties["Button 4 id"], json!("b4"));
+        // A dial is a keypad that also turns. The driver tells them apart; the list does not
+        // need a kind of its own to say so.
+        assert_eq!(found[0].kind, "keypad");
     }
 }

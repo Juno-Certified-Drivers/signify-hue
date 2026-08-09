@@ -13,7 +13,9 @@ crate-type = ["cdylib", "rlib"]
 # The SDK re-exports core's types, so the two are one unit: a driver built against a
 # different core than it runs on is refused by the ABI check rather than half-understood.
 # Pinning the tag is what makes that check redundant in practice.
-driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "add-button-proxy" }
+# v0.13.0 is that branch, merged and tagged. A tag is reproducible where a branch pin is
+# not: a branch resolves to whatever it is on the day somebody builds.
+driver-sdk = { git = "https://github.com/junohouse/driver-sdk", tag = "v0.13.0" }
 
 # Working on core and this driver at once: point the SDK at a local checkout.
 #   [patch."https://github.com/junohouse/driver-sdk"]
