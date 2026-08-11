@@ -10,7 +10,7 @@ on:
 
 jobs:
   driver:
-    uses: junohouse/registry/.github/workflows/certified.yml@main
+    uses: junohouse/driver-ci/.github/workflows/certified.yml@main
     # The public build job this calls declares contents: write, and a called workflow
     # cannot be granted more than its caller has.
     permissions:
