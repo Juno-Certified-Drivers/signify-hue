@@ -1106,24 +1106,16 @@ impl HueBulb {
                             Some(false) => "bridge reports it off",
                             None => "bridge cannot reach it — is it powered?",
                         };
-                        // What the bulb can do decides which commands exist, so read it here
-                        // rather than assuming every Hue is a colour bulb. It belongs in
-                        // `verified` beside the rest of what the bridge said, not in `kind`:
-                        // a tunable white and a colour bulb are both a `light`, and putting
-                        // the difference in the kind splits one list of bulbs into three.
-                        let can = if light.get("color").is_some() {
-                            "colour"
-                        } else if light.get("color_temperature").is_some() {
-                            "tunable white"
-                        } else if light.get("dimming").is_some() {
-                            "dimmable"
-                        } else {
-                            "on/off"
-                        };
+                        // A Hue `light` is not necessarily a colour bulb. The manifest is the
+                        // source of the controls core accepts, so this choice must happen here
+                        // at import time — hiding a colour wheel in the UI would still let a
+                        // rule send `set_color` to a white bulb. `null` is not a capability;
+                        // the bridge uses it for a resource it cannot describe at the moment.
+                        let (driver_id, can) = bulb_driver(light);
                         Some(Candidate {
                             label: name.to_string(),
                             kind: "light".into(),
-                            driver_id: "signify.hue.bulb".into(),
+                            driver_id: driver_id.into(),
                             properties: [
                                 ("Bridge address".to_string(), json!(address)),
                                 ("Application key".to_string(), json!(key)),
@@ -1301,5 +1293,46 @@ impl HueBulb {
                 Value::Null,
             ),
         }
+    }
+}
+
+/// Select the narrowest bulb manifest for what one CLIP v2 light actually exposes.
+///
+/// The shared native module routes all of these by `Light id`, so separate manifests do not
+/// create separate driver behaviour. They make the feature flags part of the resolved proxy
+/// contract: controls, automations, and API validation therefore agree on what this particular
+/// fitting can do.
+fn bulb_driver(light: &Value) -> (&'static str, &'static str) {
+    let has = |name: &str| light.get(name).and_then(Value::as_object).is_some();
+    match (has("color"), has("color_temperature"), has("dimming")) {
+        (true, true, _) => ("signify.hue.bulb", "colour and tunable white"),
+        (true, false, _) => ("signify.hue.bulb.color", "colour"),
+        (false, true, true) => ("signify.hue.bulb.tunable", "tunable white"),
+        (false, true, false) => ("signify.hue.bulb.tunable", "tunable white"),
+        (false, false, true) => ("signify.hue.bulb.dimmable", "dimmable"),
+        (false, false, false) => ("signify.hue.bulb.on_off", "on/off"),
+    }
+}
+
+#[cfg(test)]
+mod bulb_capability_tests {
+    use super::*;
+
+    #[test]
+    fn a_white_hue_light_gets_a_manifest_without_colour_commands() {
+        let white = json!({ "dimming": {} });
+        assert_eq!(bulb_driver(&white).0, "signify.hue.bulb.dimmable");
+
+        let tunable = json!({ "dimming": {}, "color_temperature": {} });
+        assert_eq!(bulb_driver(&tunable).0, "signify.hue.bulb.tunable");
+
+        let colour = json!({ "dimming": {}, "color": {} });
+        assert_eq!(bulb_driver(&colour).0, "signify.hue.bulb.color");
+    }
+
+    #[test]
+    fn absent_or_null_features_are_not_capabilities() {
+        let on_off = json!({ "color": null, "color_temperature": null, "dimming": null });
+        assert_eq!(bulb_driver(&on_off).0, "signify.hue.bulb.on_off");
     }
 }
