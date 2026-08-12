@@ -3,7 +3,7 @@ id = "signify.hue.bridge"
 name = "Philips Hue Bridge"
 manufacturer = "Signify"
 version = "1.2.0"
-runtime = "native"
+runtime = "wasm"
 
 # The bridge is a device in its own right. It holds the address and the paired key once, and
 # every bulb behind it reads them from here — so a bridge that moves to a new IP is edited in
