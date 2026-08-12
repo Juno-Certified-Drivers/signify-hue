@@ -3,7 +3,7 @@ id = "signify.hue.motion"
 name = "Philips Hue Motion Sensor"
 manufacturer = "Signify"
 version = "1.2.0"
-runtime = "native"
+runtime = "wasm"
 # Sensors live behind a bridge and inherit its address and key, exactly as bulbs do.
 parent = "signify.hue.bridge"
 

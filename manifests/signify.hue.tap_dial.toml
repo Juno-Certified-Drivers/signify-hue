@@ -3,7 +3,7 @@ id = "signify.hue.tap_dial"
 name = "Philips Hue Tap Dial Switch"
 manufacturer = "Signify"
 version = "1.2.0"
-runtime = "native"
+runtime = "wasm"
 parent = "signify.hue.bridge"
 
 # Four buttons and a dial. The dial is a fifth binding rather than a property of the others, because

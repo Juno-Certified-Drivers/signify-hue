@@ -3,7 +3,7 @@ id = "signify.hue.wall_switch"
 name = "Philips Hue Wall Switch Module"
 manufacturer = "Signify"
 version = "1.2.0"
-runtime = "native"
+runtime = "wasm"
 parent = "signify.hue.bridge"
 
 # The module that sits behind an existing rocker or toggle and turns it into something the bridge
