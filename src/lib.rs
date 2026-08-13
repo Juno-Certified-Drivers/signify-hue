@@ -90,15 +90,23 @@ impl Role {
     }
 }
 
+/// A power command is deliberately only a power command. In particular, `on` must not include a
+/// dimming value: Hue then restores the light's own last level, including changes made outside
+/// Juno, instead of Juno accidentally replacing it with a cached/default 100%.
+fn power_body(on: bool, ramp_ms: Option<u64>) -> Value {
+    let mut body = json!({ "on": { "on": on } });
+    if let Some(ms) = ramp_ms {
+        body["dynamics"] = json!({ "duration": ms.min(6_553_000) });
+    }
+    body
+}
+
 /// Hue takes brightness as a percentage but treats 0 as "dimmest on", not off — so a level of
 /// 0 has to become `on: false` or the bulb sits at 1% instead of going out.
 fn level_body(level: u8, ramp_ms: Option<u64>) -> Value {
-    let mut body = json!({ "on": { "on": level > 0 } });
+    let mut body = power_body(level > 0, ramp_ms);
     if level > 0 {
         body["dimming"] = json!({ "brightness": level as f64 });
-    }
-    if let Some(ms) = ramp_ms {
-        body["dynamics"] = json!({ "duration": ms.min(6_553_000) });
     }
     body
 }
@@ -232,14 +240,21 @@ impl HueBulb {
         let known_on = inst.scratch.get("on").and_then(Value::as_bool);
 
         let on = light.pointer("/on/on").and_then(Value::as_bool).or(known_on);
-        let brightness = light.pointer("/dimming/brightness").and_then(Value::as_f64);
+        let brightness = light
+            .pointer("/dimming/brightness")
+            .and_then(Value::as_f64)
+            .map(|b| b.round().clamp(1.0, 100.0) as u64);
+
+        // An off Hue resource still carries the level it will restore on the next plain `on`.
+        // Keep it even though the effective level reported to Juno below is zero.
+        if let Some(level) = brightness {
+            inst.scratch.insert("level".into(), json!(level));
+        }
 
         if on.is_some() || brightness.is_some() {
             let level = match on {
                 Some(false) => 0,
-                _ => brightness
-                    .map(|b| b.round().clamp(1.0, 100.0) as u64)
-                    .unwrap_or(known_level),
+                _ => brightness.unwrap_or(known_level),
             };
             if level > 0 {
                 inst.scratch.insert("level".into(), json!(level));
@@ -310,11 +325,12 @@ impl DriverModule for HueBulb {
 
         let (body, level) = match cmd {
             "on" => {
-                // Returning to the level it was at is what people expect from a light switch.
+                // Let the bridge restore its authoritative last level. The remembered value is
+                // only for an immediate optimistic notification; it is not sent as brightness.
                 let restore = if last == 0 { 100 } else { last };
-                (level_body(restore, ramp), Some(restore))
+                (power_body(true, ramp), Some(restore))
             }
-            "off" => (level_body(0, ramp), Some(0)),
+            "off" => (power_body(false, ramp), Some(0)),
             "toggle" => {
                 let cur = inst
                     .scratch
@@ -322,7 +338,7 @@ impl DriverModule for HueBulb {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let next = if cur { 0 } else if last == 0 { 100 } else { last };
-                (level_body(next, ramp), Some(next))
+                (power_body(!cur, ramp), Some(next))
             }
             "set_level" => {
                 let l = args.get("level").and_then(Value::as_u64).unwrap_or(0) as u8;
@@ -1318,6 +1334,53 @@ fn bulb_driver(light: &Value) -> (&'static str, &'static str) {
 mod bulb_capability_tests {
     use super::*;
 
+    fn request_body(calls: &[HostCall]) -> Value {
+        let HostCall::Http(request) = &calls[0] else {
+            panic!("first call was not an HTTP request")
+        };
+        serde_json::from_str(request.body.as_deref().expect("request body")).unwrap()
+    }
+
+    fn bulb() -> Instance {
+        let mut inst = Instance::new(1);
+        inst.properties
+            .insert("Bridge address".into(), json!("192.0.2.1"));
+        inst.properties.insert("Application key".into(), json!("key"));
+        inst.properties.insert("Light id".into(), json!("light"));
+        inst
+    }
+
+    #[test]
+    fn plain_on_is_power_only_while_set_level_explicitly_sets_brightness() {
+        let mut inst = bulb();
+        inst.scratch.insert("level".into(), json!(23));
+
+        let on = HueBulb.on_command(&mut inst, 1, "on", &Args::new());
+        assert_eq!(request_body(&on), json!({ "on": { "on": true } }));
+
+        let mut args = Args::new();
+        args.insert("level".into(), json!(100));
+        let level = HueBulb.on_command(&mut inst, 1, "set_level", &args);
+        assert_eq!(
+            request_body(&level),
+            json!({ "on": { "on": true }, "dimming": { "brightness": 100.0 } })
+        );
+    }
+
+    #[test]
+    fn an_off_resource_remembers_the_level_hue_will_restore() {
+        let mut inst = bulb();
+        HueBulb::report(
+            &mut inst,
+            &json!({ "on": { "on": false }, "dimming": { "brightness": 17.0 } }),
+        );
+
+        assert_eq!(inst.scratch.get("level"), Some(&json!(17)));
+        assert_eq!(inst.scratch.get("on"), Some(&json!(false)));
+        let on = HueBulb.on_command(&mut inst, 1, "on", &Args::new());
+        assert_eq!(request_body(&on), json!({ "on": { "on": true } }));
+    }
+
     #[test]
     fn a_white_hue_light_gets_a_manifest_without_colour_commands() {
         let white = json!({ "dimming": {} });
@@ -1334,5 +1397,18 @@ mod bulb_capability_tests {
     fn absent_or_null_features_are_not_capabilities() {
         let on_off = json!({ "color": null, "color_temperature": null, "dimming": null });
         assert_eq!(bulb_driver(&on_off).0, "signify.hue.bulb.on_off");
+
+        // This is the shape a real warm/white Hue resource uses: the keys may be present in a
+        // generic response, but `color: null` is not a color gamut.  The concrete temperature
+        // object is the capability evidence, so this must never receive the full-color manifest.
+        let warm_white = json!({
+            "dimming": { "brightness": 42.0 },
+            "color_temperature": { "mirek": 366, "mirek_valid": true },
+            "color": null
+        });
+        assert_eq!(
+            bulb_driver(&warm_white).0,
+            "signify.hue.bulb.tunable"
+        );
     }
 }
