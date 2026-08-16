@@ -188,6 +188,11 @@ impl HueBulb {
     /// ```text
     /// [{"type":"update","data":[{"id":"<rid>","type":"light","dimming":{"brightness":42}}]}]
     /// ```
+    ///
+    /// The envelope's own `type` is `update`, `add` or `delete`, and the difference matters:
+    /// `add` is somebody pairing a bulb in the Hue app, and its resources belong to nothing in
+    /// the project. Read as an update it matches no adopted device and is silently dropped, so
+    /// a new bulb stays invisible to Juno until a person happens to run setup again.
     fn on_stream(&self, inst: &mut Instance, args: &Args) -> Vec<HostCall> {
         let Some(text) = args.get("data").and_then(Value::as_str) else {
             return Vec::new();
@@ -198,8 +203,9 @@ impl HueBulb {
 
         let mut out = Vec::new();
         for update in frame.as_array().into_iter().flatten() {
+            let kind = update.get("type").and_then(Value::as_str).unwrap_or("update");
             for resource in update.get("data").and_then(Value::as_array).into_iter().flatten() {
-                out.extend(Self::mine(inst, resource));
+                out.extend(Self::mine(inst, kind, resource));
             }
         }
         out
@@ -211,7 +217,15 @@ impl HueBulb {
     /// bridge publishes the whole house on one connection and core hands each frame to all of it.
     /// The dispatch is on the device's role rather than on the resource's `type`, because the
     /// question being answered is "is this mine", and only the device knows which ids are its own.
-    fn mine(inst: &mut Instance, resource: &Value) -> Vec<HostCall> {
+    fn mine(inst: &mut Instance, kind: &str, resource: &Value) -> Vec<HostCall> {
+        // Nothing already in the project can own a resource that has just been created, so an
+        // `add` never reaches the roles below — only the bridge, which offers it to core.
+        if kind == "add" {
+            return match Role::of(inst) {
+                Role::Bridge => Self::offer(resource),
+                _ => Vec::new(),
+            };
+        }
         match Role::of(inst) {
             Role::Bulb => {
                 let mine = inst.property("Light id").as_str().map(str::to_string);
@@ -225,6 +239,45 @@ impl HueBulb {
             // The bridge hearing its own stream. Everything on it belongs to something behind it.
             Role::Bridge => Vec::new(),
         }
+    }
+
+    /// A resource the bridge has just gained, told to core so it can ask whether the house wants it.
+    ///
+    /// Only `device` resources, and that is the whole trick. Pairing one bulb creates five or six
+    /// resources — the `device`, its `light`, its `zigbee_connectivity`, an entertainment segment,
+    /// a vendor-specific blob — and every one of them arrives as its own `add`. Offering all of
+    /// them would put six prompts on somebody's phone for one bulb they just screwed in. The
+    /// `device` is the one that stands for the physical thing.
+    fn offer(resource: &Value) -> Vec<HostCall> {
+        if resource.get("type").and_then(Value::as_str) != Some("device") {
+            return Vec::new();
+        }
+        let Some(id) = resource.get("id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let product = resource.get("product_data");
+        // `metadata.name` is what the person typed in the Hue app, and is missing when they
+        // accepted the default. The product name is Signify's own ("Hue color lamp") and is
+        // always there, which makes it the better fallback than printing a UUID at somebody.
+        let name = resource
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| product?.get("product_name")?.as_str())
+            .unwrap_or(id);
+        let kind = product
+            .and_then(|p| p.get("product_archetype"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let args = [
+            ("id", json!(id)),
+            ("name", json!(name)),
+            ("kind", json!(kind)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        vec![HostCall::notify(1, "device_added", args)]
     }
 
     /// Turn a light resource — from a poll or from the stream, they are the same shape — into
@@ -506,7 +559,10 @@ impl DriverModule for HueBulb {
         };
         let mut out = Vec::new();
         for resource in data {
-            out.extend(Self::mine(inst, resource));
+            // Always `update`, never `add`. A poll is a snapshot of what is already there, and
+            // the collection reads at start return the whole house — treating those as additions
+            // would offer every bulb already adopted, as new, on every controller restart.
+            out.extend(Self::mine(inst, "update", resource));
         }
         out
     }
@@ -514,6 +570,63 @@ impl DriverModule for HueBulb {
 
 
 export_driver!(HueBulb);
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn offered(resource: Value) -> Option<(String, String, String)> {
+        match HueBulb::offer(&resource).into_iter().next()? {
+            HostCall::Notify { name, args, .. } => {
+                assert_eq!(name, "device_added");
+                let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                Some((s("id"), s("name"), s("kind")))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_paired_bulb_is_offered_once_and_not_six_times() {
+        // What the bridge actually pushes when one bulb is paired in the Hue app: the device
+        // and every service hanging off it, each as its own `add`. Only the device is a thing
+        // a person would recognise as "a new light".
+        let device = json!({
+            "id": "b8b7-1", "type": "device",
+            "metadata": { "name": "Porch" },
+            "product_data": { "product_name": "Hue color lamp", "product_archetype": "sultan_bulb" }
+        });
+        assert_eq!(
+            offered(device),
+            Some(("b8b7-1".into(), "Porch".into(), "sultan_bulb".into()))
+        );
+        for service in ["light", "zigbee_connectivity", "entertainment", "taurus_7455"] {
+            assert_eq!(HueBulb::offer(&json!({ "id": "x", "type": service })).len(), 0);
+        }
+    }
+
+    #[test]
+    fn a_bulb_left_at_its_default_name_is_still_named() {
+        // No `metadata.name` because nobody typed one. Falling through to the UUID would put
+        // "0b216d8e-… was added" on somebody's phone.
+        let (_, name, _) = offered(json!({
+            "id": "0b216d8e", "type": "device",
+            "product_data": { "product_name": "Hue dimmer switch" }
+        }))
+        .expect("a device with no chosen name is still offered");
+        assert_eq!(name, "Hue dimmer switch");
+    }
+
+    #[test]
+    fn a_poll_never_offers_anything() {
+        // The guard that keeps a controller restart quiet: the five collection reads at start
+        // return every adopted device, and they arrive as `update`.
+        let mut inst = Instance::default(); // no ids set, so Role::of is Bridge
+        let device = json!({ "id": "b8b7-1", "type": "device", "metadata": { "name": "Porch" } });
+        assert_eq!(HueBulb::mine(&mut inst, "update", &device).len(), 0);
+        assert_eq!(HueBulb::mine(&mut inst, "add", &device).len(), 1);
+    }
+}
 
 
 // ---------------------------------------------------------------------------------------
