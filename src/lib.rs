@@ -161,7 +161,445 @@ const AT_START: &[&str] = &[
     "temperature",
     "light_level",
     "device_power",
+    // Zones are inventory, not Juno-owned configuration. Reading them lets a logical group use
+    // an exact existing match without ever renaming it or changing its members.
+    "zone",
 ];
+
+const HUE_BRIDGE_ID: &str = "hue_bridge_id";
+const HUE_ZONES: &str = "hue_zones";
+const HUE_GROUP_LINKS: &str = "hue_group_links";
+const HUE_GROUP_PENDING: &str = "hue_group_pending";
+const HUE_GROUP_PROBLEM: &str = "hue_group_problem";
+
+fn bridge_http(
+    inst: &Instance,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Option<HostCall> {
+    let bridge = inst.property("Bridge address").as_str()?;
+    let key = inst.property("Application key").as_str().unwrap_or("");
+    if bridge.is_empty() {
+        return None;
+    }
+    let mut request = HttpRequest::new(method, format!("https://{bridge}{path}"))
+        .header("hue-application-key", key);
+    if let Some(body) = body {
+        request = request.json(body.to_string());
+    }
+    Some(HostCall::Http(request))
+}
+
+fn group_key(group: DeviceId) -> String {
+    group.to_string()
+}
+
+fn group_light_ids(request: &GroupRequest) -> Result<Vec<String>, String> {
+    let mut ids = Vec::with_capacity(request.members.len());
+    for member in &request.members {
+        let Some(id) = member.instance.property("Light id").as_str() else {
+            return Err(format!("device {} is not a Hue light", member.device));
+        };
+        if id.is_empty() {
+            return Err(format!("device {} has no Hue light id", member.device));
+        }
+        ids.push(id.to_string());
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.len() != request.members.len() {
+        return Err("the group contains the same Hue light more than once".into());
+    }
+    if ids.is_empty() {
+        return Err("the group has no Hue lights".into());
+    }
+    Ok(ids)
+}
+
+fn zone_light_ids(zone: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = zone
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|child| child.get("rtype").and_then(Value::as_str) == Some("light"))
+        .filter_map(|child| child.get("rid").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn zone_grouped_light(zone: &Value) -> Option<&str> {
+    zone.get("services")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|service| service.get("rtype").and_then(Value::as_str) == Some("grouped_light"))
+        .and_then(|service| service.get("rid"))
+        .and_then(Value::as_str)
+}
+
+fn zone_name(zone: &Value) -> &str {
+    zone.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("Unnamed Hue zone")
+}
+
+fn cached_zones(inst: &Instance) -> Vec<&Value> {
+    inst.scratch
+        .get(HUE_ZONES)
+        .and_then(Value::as_array)
+        .map(|zones| zones.iter().collect())
+        .unwrap_or_default()
+}
+
+fn cached_zone<'a>(inst: &'a Instance, id: &str) -> Option<&'a Value> {
+    cached_zones(inst)
+        .into_iter()
+        .find(|zone| zone.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn group_link(inst: &Instance, group: DeviceId) -> Option<Value> {
+    inst.scratch
+        .get(HUE_GROUP_LINKS)
+        .and_then(Value::as_object)
+        .and_then(|links| links.get(&group_key(group)))
+        .cloned()
+}
+
+fn set_group_link(inst: &mut Instance, group: DeviceId, link: Value) {
+    if !inst
+        .scratch
+        .get(HUE_GROUP_LINKS)
+        .is_some_and(Value::is_object)
+    {
+        inst.scratch.insert(HUE_GROUP_LINKS.into(), json!({}));
+    }
+    if let Some(links) = inst
+        .scratch
+        .get_mut(HUE_GROUP_LINKS)
+        .and_then(Value::as_object_mut)
+    {
+        links.insert(group_key(group), link);
+    }
+}
+
+fn remove_group_link(inst: &mut Instance, group: DeviceId) {
+    if let Some(links) = inst
+        .scratch
+        .get_mut(HUE_GROUP_LINKS)
+        .and_then(Value::as_object_mut)
+    {
+        links.remove(&group_key(group));
+    }
+}
+
+fn bridge_id(inst: &Instance) -> Option<&str> {
+    inst.scratch.get(HUE_BRIDGE_ID).and_then(Value::as_str)
+}
+
+fn owned_zone_name(group: DeviceId, name: &str) -> (String, String) {
+    // The suffix is visible evidence when somebody inspects the Hue app, but never ownership
+    // authority by itself. Only the bridge-scoped local record below grants mutation rights.
+    let token = format!("[Juno {group:08X}]");
+    let room = 32usize.saturating_sub(token.chars().count() + 1);
+    let prefix: String = name.chars().take(room).collect();
+    (format!("{prefix} {token}"), token)
+}
+
+fn zone_children(light_ids: &[String]) -> Value {
+    Value::Array(
+        light_ids
+            .iter()
+            .map(|id| json!({ "rid": id, "rtype": "light" }))
+            .collect(),
+    )
+}
+
+fn group_status(inst: &Instance, request: &GroupRequest) -> Value {
+    let desired = group_light_ids(request).unwrap_or_default();
+    let link = group_link(inst, request.group);
+    let linked_zone = link
+        .as_ref()
+        .and_then(|l| l.get("zone").and_then(Value::as_str))
+        .and_then(|id| cached_zone(inst, id));
+
+    let zones: Vec<Value> = cached_zones(inst)
+        .into_iter()
+        .filter_map(|zone| {
+            let id = zone.get("id").and_then(Value::as_str)?;
+            let members = zone_light_ids(zone);
+            Some(json!({
+                "resource": id,
+                "name": zone_name(zone),
+                "members": members,
+                "exact_match": members == desired,
+                "controllable": zone_grouped_light(zone).is_some(),
+                // A name that looks like ours is intentionally not treated as ownership.
+                "juno_owned": link.as_ref().is_some_and(|l|
+                    l.get("ownership").and_then(Value::as_str) == Some("juno")
+                        && l.get("zone").and_then(Value::as_str) == Some(id)),
+            }))
+        })
+        .collect();
+
+    let linked = link.map(|mut link| {
+        let valid = linked_zone.is_some_and(|zone| {
+            zone_light_ids(zone) == desired
+                && zone_grouped_light(zone)
+                    == link.get("grouped_light").and_then(Value::as_str)
+                && bridge_id(inst) == link.get("bridge_id").and_then(Value::as_str)
+        });
+        if let Some(object) = link.as_object_mut() {
+            object.remove("token");
+            object.remove("light_ids");
+            object.insert("valid".into(), json!(valid));
+        }
+        link
+    });
+
+    json!({
+        "bridge_ready": bridge_id(inst).is_some(),
+        "linked": linked,
+        "zones": zones,
+        "problem": inst.scratch.get(HUE_GROUP_PROBLEM).cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn refused(problem: impl Into<String>, status: Value) -> GroupResponse {
+    GroupResponse {
+        disposition: GroupDisposition::Refused,
+        problem: Some(problem.into()),
+        status,
+        ..Default::default()
+    }
+}
+
+fn member_is_on(member: &GroupMember) -> bool {
+    member
+        .state
+        .get("level")
+        .and_then(Value::as_u64)
+        .is_some_and(|level| level > 0)
+        || member
+            .instance
+            .scratch
+            .get("on")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn member_last_level(member: &GroupMember) -> u8 {
+    member
+        .instance
+        .scratch
+        .get("level")
+        .and_then(Value::as_u64)
+        .or_else(|| member.state.get("level").and_then(Value::as_u64))
+        .unwrap_or(100)
+        .clamp(1, 100) as u8
+}
+
+fn grouped_command(
+    request: &GroupRequest,
+    command: &str,
+    args: &Args,
+) -> Result<(Value, Vec<GroupMemberCalls>), String> {
+    let ramp = args.get("ramp_ms").and_then(Value::as_u64);
+    let any_on = request.members.iter().any(member_is_on);
+    let representative_level = request
+        .members
+        .iter()
+        .map(member_last_level)
+        .max()
+        .unwrap_or(100);
+
+    let (body, shared_level, restore_each) = match command {
+        "on" => (power_body(true, ramp), None, true),
+        "off" => (power_body(false, ramp), Some(0), false),
+        "toggle" if any_on => (power_body(false, ramp), Some(0), false),
+        "toggle" => (power_body(true, ramp), None, true),
+        "set_level" => {
+            let level = args
+                .get("level")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(100) as u8;
+            (level_body(level, ramp), Some(level), false)
+        }
+        "set_cct" => {
+            let kelvin = args.get("kelvin").and_then(Value::as_u64).unwrap_or(2700);
+            let mirek = (1_000_000 / kelvin.max(1)).clamp(153, 500);
+            (
+                json!({ "color_temperature": { "mirek": mirek } }),
+                None,
+                false,
+            )
+        }
+        "set_color" => {
+            let hue = args.get("hue").and_then(Value::as_f64).unwrap_or(0.0);
+            let sat = args.get("sat").and_then(Value::as_f64).unwrap_or(0.0);
+            let (x, y) = hs_to_xy(hue, sat);
+            (json!({ "color": { "xy": { "x": x, "y": y } } }), None, false)
+        }
+        "ramp_start" | "ramp_stop" => {
+            let up = args.get("direction").and_then(Value::as_str) == Some("up");
+            let target = if command == "ramp_stop" {
+                representative_level
+            } else if up {
+                100
+            } else {
+                1
+            };
+            (level_body(target, Some(4000)), Some(target), false)
+        }
+        other => return Err(format!("Hue grouped control does not support `{other}`")),
+    };
+
+    let members = request
+        .members
+        .iter()
+        .map(|member| {
+            let mut scratch = member.instance.scratch.clone();
+            let mut calls = Vec::new();
+            let level = if restore_each {
+                Some(member_last_level(member))
+            } else {
+                shared_level
+            };
+            if let Some(level) = level {
+                if level > 0 {
+                    scratch.insert("level".into(), json!(level));
+                }
+                scratch.insert("on".into(), json!(level > 0));
+                calls.extend(HueBulb::optimistic(level));
+            }
+            if command == "set_cct"
+                && let Some(kelvin) = args.get("kelvin").and_then(Value::as_u64)
+            {
+                let mut changed = Args::new();
+                changed.insert("kelvin".into(), json!(kelvin));
+                calls.push(HostCall::notify(member.proxy, "cct_changed", changed));
+            }
+            if command == "set_color" {
+                let mut changed = Args::new();
+                changed.insert("hue".into(), args.get("hue").cloned().unwrap_or(json!(0.0)));
+                changed.insert("sat".into(), args.get("sat").cloned().unwrap_or(json!(0.0)));
+                calls.push(HostCall::notify(member.proxy, "color_changed", changed));
+            }
+            GroupMemberCalls {
+                device: member.device,
+                calls,
+                scratch: Some(scratch),
+            }
+        })
+        .collect();
+    Ok((body, members))
+}
+
+fn validated_grouped_light(
+    inst: &Instance,
+    request: &GroupRequest,
+) -> Result<String, String> {
+    let desired = group_light_ids(request)?;
+    let link = group_link(inst, request.group)
+        .ok_or_else(|| "this Juno group is not linked to a Hue zone".to_string())?;
+    let current_bridge = bridge_id(inst)
+        .ok_or_else(|| "the Hue bridge identity has not loaded yet".to_string())?;
+    if link.get("bridge_id").and_then(Value::as_str) != Some(current_bridge) {
+        return Err("the saved zone belongs to a different Hue bridge".into());
+    }
+    let zone_id = link
+        .get("zone")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the saved Hue zone link is incomplete".to_string())?;
+    let zone = cached_zone(inst, zone_id)
+        .ok_or_else(|| "the linked Hue zone no longer exists".to_string())?;
+    if zone_light_ids(zone) != desired {
+        return Err("the linked Hue zone membership changed; using individual lights".into());
+    }
+    let grouped = zone_grouped_light(zone)
+        .ok_or_else(|| "the linked Hue zone has no grouped-light service".to_string())?;
+    if link.get("grouped_light").and_then(Value::as_str) != Some(grouped) {
+        return Err("the linked Hue zone service changed; using individual lights".into());
+    }
+    Ok(grouped.to_string())
+}
+
+fn cache_zone_inventory(inst: &mut Instance, data: &[Value]) {
+    let zones: Vec<Value> = data
+        .iter()
+        .filter(|resource| {
+            resource.get("type").and_then(Value::as_str) == Some("zone")
+                || resource.get("rtype").and_then(Value::as_str) == Some("zone")
+        })
+        .cloned()
+        .collect();
+    inst.scratch.insert(HUE_ZONES.into(), Value::Array(zones));
+    finish_group_pending(inst);
+}
+
+fn finish_group_pending(inst: &mut Instance) {
+    let Some(pending) = inst.scratch.get(HUE_GROUP_PENDING).cloned() else {
+        return;
+    };
+    let Some(zone_id) = pending.get("zone").and_then(Value::as_str) else {
+        return; // a create is still waiting for Hue to return the new resource id
+    };
+    let Some(zone) = cached_zone(inst, zone_id).cloned() else {
+        inst.scratch.insert(
+            HUE_GROUP_PROBLEM.into(),
+            json!("Hue did not return the zone after writing it"),
+        );
+        inst.scratch.remove(HUE_GROUP_PENDING);
+        return;
+    };
+    let expected: Vec<String> = pending
+        .get("light_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .collect();
+    let Some(grouped_light) = zone_grouped_light(&zone).map(str::to_string) else {
+        inst.scratch.insert(
+            HUE_GROUP_PROBLEM.into(),
+            json!("Hue created a zone without grouped-light control"),
+        );
+        inst.scratch.remove(HUE_GROUP_PENDING);
+        return;
+    };
+    let token = pending.get("token").and_then(Value::as_str).unwrap_or("");
+    if zone_light_ids(&zone) != expected || !zone_name(&zone).contains(token) {
+        inst.scratch.insert(
+            HUE_GROUP_PROBLEM.into(),
+            json!("Hue returned a zone that did not match Juno's requested name and members"),
+        );
+        inst.scratch.remove(HUE_GROUP_PENDING);
+        return;
+    }
+    let Some(group) = pending.get("group").and_then(Value::as_u64) else {
+        inst.scratch.remove(HUE_GROUP_PENDING);
+        return;
+    };
+    set_group_link(
+        inst,
+        group as DeviceId,
+        json!({
+            "ownership": "juno",
+            "bridge_id": pending.get("bridge_id").cloned().unwrap_or(Value::Null),
+            "zone": zone_id,
+            "grouped_light": grouped_light,
+            "light_ids": expected,
+            "token": token,
+            "name": zone_name(&zone),
+        }),
+    );
+    inst.scratch.remove(HUE_GROUP_PENDING);
+    inst.scratch.remove(HUE_GROUP_PROBLEM);
+}
 
 impl HueBulb {
     fn request(inst: &Instance, body: Value) -> Option<HostCall> {
@@ -197,10 +635,22 @@ impl HueBulb {
         };
 
         let mut out = Vec::new();
+        let mut zone_changed = false;
         for update in frame.as_array().into_iter().flatten() {
             for resource in update.get("data").and_then(Value::as_array).into_iter().flatten() {
+                zone_changed |= resource.get("type").and_then(Value::as_str) == Some("zone")
+                    || resource.get("rtype").and_then(Value::as_str) == Some("zone");
                 out.extend(Self::mine(inst, resource));
             }
+        }
+        // Zone update events may be partial. Re-reading the small collection keeps membership
+        // validation authoritative and ensures an external Hue edit disables native dispatch
+        // before the next command instead of trying to merge a partial patch incorrectly.
+        if Role::of(inst) == Role::Bridge
+            && zone_changed
+            && let Some(call) = bridge_http(inst, "GET", "/clip/v2/resource/zone", None)
+        {
+            out.push(call);
         }
         out
     }
@@ -403,6 +853,208 @@ impl DriverModule for HueBulb {
         out
     }
 
+    fn on_group(&self, inst: &mut Instance, request: &GroupRequest) -> GroupResponse {
+        if Role::of(inst) != Role::Bridge {
+            return refused("Hue grouped control must run on the bridge", Value::Null);
+        }
+        let status = || group_status(inst, request);
+        match &request.operation {
+            GroupOperation::Status => GroupResponse {
+                disposition: GroupDisposition::Handled,
+                status: status(),
+                ..Default::default()
+            },
+            GroupOperation::Link { resource } => {
+                let desired = match group_light_ids(request) {
+                    Ok(ids) => ids,
+                    Err(problem) => return refused(problem, status()),
+                };
+                let Some(current_bridge) = bridge_id(inst).map(str::to_string) else {
+                    return refused("the Hue bridge identity has not loaded yet", status());
+                };
+                let Some(zone) = cached_zone(inst, resource).cloned() else {
+                    return refused("that Hue zone no longer exists", status());
+                };
+                if zone_light_ids(&zone) != desired {
+                    return refused(
+                        "an existing Hue zone can only be linked when its lights exactly match",
+                        status(),
+                    );
+                }
+                let Some(grouped_light) = zone_grouped_light(&zone).map(str::to_string) else {
+                    return refused("that Hue zone cannot control its lights as a group", status());
+                };
+                set_group_link(
+                    inst,
+                    request.group,
+                    json!({
+                        "ownership": "external",
+                        "bridge_id": current_bridge,
+                        "zone": resource,
+                        "grouped_light": grouped_light,
+                        "light_ids": desired,
+                        "name": zone_name(&zone),
+                    }),
+                );
+                inst.scratch.remove(HUE_GROUP_PROBLEM);
+                GroupResponse {
+                    disposition: GroupDisposition::Handled,
+                    status: group_status(inst, request),
+                    ..Default::default()
+                }
+            }
+            GroupOperation::Create => {
+                if group_link(inst, request.group).is_some() {
+                    return refused(
+                        "detach the current Hue zone before creating another one",
+                        status(),
+                    );
+                }
+                if inst.scratch.contains_key(HUE_GROUP_PENDING) {
+                    return refused("another Hue zone write is still in progress", status());
+                }
+                let light_ids = match group_light_ids(request) {
+                    Ok(ids) => ids,
+                    Err(problem) => return refused(problem, status()),
+                };
+                let Some(current_bridge) = bridge_id(inst).map(str::to_string) else {
+                    return refused("the Hue bridge identity has not loaded yet", status());
+                };
+                let (name, token) = owned_zone_name(request.group, &request.name);
+                let body = json!({
+                    "metadata": { "name": name, "archetype": "other" },
+                    "children": zone_children(&light_ids),
+                });
+                let Some(call) = bridge_http(inst, "POST", "/clip/v2/resource/zone", Some(body))
+                else {
+                    return refused("the Hue bridge connection is not configured", status());
+                };
+                inst.scratch.insert(
+                    HUE_GROUP_PENDING.into(),
+                    json!({
+                        "operation": "create",
+                        "group": request.group,
+                        "bridge_id": current_bridge,
+                        "light_ids": light_ids,
+                        "token": token,
+                        "name": name,
+                    }),
+                );
+                GroupResponse {
+                    disposition: GroupDisposition::Queued,
+                    status: json!({ "pending": "create" }),
+                    calls: vec![call],
+                    ..Default::default()
+                }
+            }
+            GroupOperation::Synchronize => {
+                if inst.scratch.contains_key(HUE_GROUP_PENDING) {
+                    return refused("another Hue zone write is still in progress", status());
+                }
+                let Some(link) = group_link(inst, request.group) else {
+                    return refused("this group has no linked Hue zone", status());
+                };
+                if link.get("ownership").and_then(Value::as_str) != Some("juno") {
+                    return refused(
+                        "existing Hue zones stay Hue-owned and cannot be reconfigured by Juno",
+                        status(),
+                    );
+                }
+                let Some(current_bridge) = bridge_id(inst).map(str::to_string) else {
+                    return refused("the Hue bridge identity has not loaded yet", status());
+                };
+                if link.get("bridge_id").and_then(Value::as_str) != Some(&current_bridge) {
+                    return refused("the saved zone belongs to a different Hue bridge", status());
+                }
+                let Some(zone_id) = link.get("zone").and_then(Value::as_str).map(str::to_string)
+                else {
+                    return refused("the saved Hue zone link is incomplete", status());
+                };
+                let Some(zone) = cached_zone(inst, &zone_id) else {
+                    return refused("the Juno-created Hue zone no longer exists", status());
+                };
+                let token = link.get("token").and_then(Value::as_str).unwrap_or("");
+                if token.is_empty() || !zone_name(zone).contains(token) {
+                    return refused(
+                        "the Juno ownership marker was removed; refusing to modify this zone",
+                        status(),
+                    );
+                }
+                let light_ids = match group_light_ids(request) {
+                    Ok(ids) => ids,
+                    Err(problem) => return refused(problem, status()),
+                };
+                let (name, _) = owned_zone_name(request.group, &request.name);
+                let body = json!({
+                    "metadata": { "name": name },
+                    "children": zone_children(&light_ids),
+                });
+                let Some(call) = bridge_http(
+                    inst,
+                    "PUT",
+                    &format!("/clip/v2/resource/zone/{zone_id}"),
+                    Some(body),
+                ) else {
+                    return refused("the Hue bridge connection is not configured", status());
+                };
+                inst.scratch.insert(
+                    HUE_GROUP_PENDING.into(),
+                    json!({
+                        "operation": "synchronize",
+                        "group": request.group,
+                        "bridge_id": current_bridge,
+                        "zone": zone_id,
+                        "light_ids": light_ids,
+                        "token": token,
+                        "name": name,
+                    }),
+                );
+                GroupResponse {
+                    disposition: GroupDisposition::Queued,
+                    status: json!({ "pending": "synchronize" }),
+                    calls: vec![call],
+                    ..Default::default()
+                }
+            }
+            GroupOperation::Detach => {
+                // Detach is deliberately local. Even a Juno-created zone remains recoverable in
+                // Hue until an explicit, separately designed delete operation exists.
+                remove_group_link(inst, request.group);
+                inst.scratch.remove(HUE_GROUP_PROBLEM);
+                GroupResponse {
+                    disposition: GroupDisposition::Handled,
+                    status: group_status(inst, request),
+                    ..Default::default()
+                }
+            }
+            GroupOperation::Command { command, args } => {
+                let grouped_light = match validated_grouped_light(inst, request) {
+                    Ok(id) => id,
+                    Err(problem) => return refused(problem, status()),
+                };
+                let (body, members) = match grouped_command(request, command, args) {
+                    Ok(plan) => plan,
+                    Err(problem) => return refused(problem, status()),
+                };
+                let Some(call) = bridge_http(
+                    inst,
+                    "PUT",
+                    &format!("/clip/v2/resource/grouped_light/{grouped_light}"),
+                    Some(body),
+                ) else {
+                    return refused("the Hue bridge connection is not configured", status());
+                };
+                GroupResponse {
+                    disposition: GroupDisposition::Handled,
+                    status: status(),
+                    calls: vec![call],
+                    members,
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
     /// Ask the bridge where this bulb actually is, rather than assuming.
     ///
     /// Without this a freshly adopted light shows no state until someone commands it, which
@@ -448,6 +1100,14 @@ impl DriverModule for HueBulb {
                 data: request.into_bytes(),
             });
 
+            // The v1 config endpoint is the bridge's durable identity. A zone UUID plus a local
+            // ownership record is not enough if somebody points this device at a replacement
+            // bridge later; binding the record to `bridgeid` closes that accidental write path.
+            out.push(HostCall::Http(HttpRequest::new(
+                "GET",
+                format!("https://{bridge}/api/config"),
+            )));
+
             // And one read of each kind of state, so a freshly started controller knows where the
             // house stands without waiting for something to change.
             //
@@ -489,6 +1149,73 @@ impl DriverModule for HueBulb {
         }
         if note != "http_response" {
             return Vec::new();
+        }
+        if Role::of(inst) == Role::Bridge {
+            let body = args.get("body").cloned().unwrap_or(Value::Null);
+            if let Some(id) = body.get("bridgeid").and_then(Value::as_str) {
+                inst.scratch.insert(HUE_BRIDGE_ID.into(), json!(id));
+            }
+
+            let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+            let method = args.get("method").and_then(Value::as_str).unwrap_or("");
+            let status = args.get("status").and_then(Value::as_u64).unwrap_or(200);
+            if url.contains("/clip/v2/resource/zone") {
+                if status >= 400 {
+                    inst.scratch.insert(
+                        HUE_GROUP_PROBLEM.into(),
+                        json!(format!("Hue rejected the zone write with HTTP {status}")),
+                    );
+                    inst.scratch.remove(HUE_GROUP_PENDING);
+                    return Vec::new();
+                }
+                if method.eq_ignore_ascii_case("POST") {
+                    let created = body
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .find(|resource| {
+                            resource.get("rtype").and_then(Value::as_str) == Some("zone")
+                                || resource.get("type").and_then(Value::as_str) == Some("zone")
+                        })
+                        .and_then(|resource| {
+                            resource
+                                .get("rid")
+                                .or_else(|| resource.get("id"))
+                                .and_then(Value::as_str)
+                        })
+                        .map(str::to_string);
+                    if let (Some(zone), Some(pending)) = (
+                        created,
+                        inst.scratch
+                            .get_mut(HUE_GROUP_PENDING)
+                            .and_then(Value::as_object_mut),
+                    ) {
+                        pending.insert("zone".into(), json!(zone));
+                    } else {
+                        inst.scratch.insert(
+                            HUE_GROUP_PROBLEM.into(),
+                            json!("Hue did not identify the zone it created"),
+                        );
+                        inst.scratch.remove(HUE_GROUP_PENDING);
+                        return Vec::new();
+                    }
+                    return bridge_http(inst, "GET", "/clip/v2/resource/zone", None)
+                        .into_iter()
+                        .collect();
+                }
+                if method.eq_ignore_ascii_case("PUT") {
+                    return bridge_http(inst, "GET", "/clip/v2/resource/zone", None)
+                        .into_iter()
+                        .collect();
+                }
+                if method.eq_ignore_ascii_case("GET")
+                    && let Some(data) = body.get("data").and_then(Value::as_array)
+                {
+                    cache_zone_inventory(inst, data);
+                    return Vec::new();
+                }
+            }
         }
         // CLIP v2 answers `{"errors": [], "data": [ … ]}` — one entry for a single resource,
         // everything of that type for a collection. Core hands a bridge's answer to the devices
@@ -1410,5 +2137,178 @@ mod bulb_capability_tests {
             bulb_driver(&warm_white).0,
             "signify.hue.bulb.tunable"
         );
+    }
+}
+
+#[cfg(test)]
+mod grouped_zone_tests {
+    use super::*;
+
+    const ZONE: &str = "11111111-1111-1111-1111-111111111111";
+    const GROUPED: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn bridge() -> Instance {
+        let mut inst = Instance::new(10);
+        inst.properties
+            .insert("Bridge address".into(), json!("192.0.2.1"));
+        inst.properties.insert("Application key".into(), json!("key"));
+        inst.scratch.insert(HUE_BRIDGE_ID.into(), json!("BRIDGE-A"));
+        inst.scratch.insert(
+            HUE_ZONES.into(),
+            json!([{
+                "id": ZONE,
+                "type": "zone",
+                "metadata": { "name": "Upstairs" },
+                "children": [
+                    { "rid": "light-a", "rtype": "light" },
+                    { "rid": "light-b", "rtype": "light" }
+                ],
+                "services": [{ "rid": GROUPED, "rtype": "grouped_light" }]
+            }]),
+        );
+        inst
+    }
+
+    fn request(operation: GroupOperation) -> GroupRequest {
+        let member = |device, id: &str| {
+            let mut instance = Instance::new(device);
+            instance.properties.insert("Light id".into(), json!(id));
+            instance.scratch.insert("level".into(), json!(42));
+            instance.scratch.insert("on".into(), json!(true));
+            GroupMember {
+                device,
+                proxy: 1,
+                instance,
+                state: Args::new(),
+            }
+        };
+        GroupRequest {
+            group: 30,
+            name: "Landing".into(),
+            state: Args::new(),
+            members: vec![member(20, "light-a"), member(21, "light-b")],
+            operation,
+        }
+    }
+
+    fn http(response: &GroupResponse) -> &HttpRequest {
+        let HostCall::Http(request) = &response.calls[0] else {
+            panic!("expected one HTTP call")
+        };
+        request
+    }
+
+    #[test]
+    fn an_exact_existing_zone_is_borrowed_and_only_its_grouped_light_is_commanded() {
+        let mut inst = bridge();
+        let linked = HueBulb.on_group(
+            &mut inst,
+            &request(GroupOperation::Link {
+                resource: ZONE.into(),
+            }),
+        );
+        assert_eq!(linked.disposition, GroupDisposition::Handled);
+        assert_eq!(
+            group_link(&inst, 30).unwrap()["ownership"],
+            json!("external")
+        );
+
+        let command = HueBulb.on_group(
+            &mut inst,
+            &request(GroupOperation::Command {
+                command: "off".into(),
+                args: Args::new(),
+            }),
+        );
+        assert_eq!(command.disposition, GroupDisposition::Handled);
+        assert_eq!(command.calls.len(), 1);
+        assert_eq!(command.members.len(), 2);
+        assert!(http(&command).url.ends_with(&format!("/grouped_light/{GROUPED}")));
+        assert!(!http(&command).url.contains("/resource/zone/"));
+
+        let sync = HueBulb.on_group(&mut inst, &request(GroupOperation::Synchronize));
+        assert_eq!(sync.disposition, GroupDisposition::Refused);
+        assert!(sync.calls.is_empty(), "a borrowed zone must never be written");
+    }
+
+    #[test]
+    fn changed_external_membership_falls_back_without_sending_a_group_request() {
+        let mut inst = bridge();
+        HueBulb.on_group(
+            &mut inst,
+            &request(GroupOperation::Link {
+                resource: ZONE.into(),
+            }),
+        );
+        inst.scratch
+            .get_mut(HUE_ZONES)
+            .and_then(Value::as_array_mut)
+            .unwrap()[0]["children"] = json!([{ "rid": "light-a", "rtype": "light" }]);
+
+        let response = HueBulb.on_group(
+            &mut inst,
+            &request(GroupOperation::Command {
+                command: "on".into(),
+                args: Args::new(),
+            }),
+        );
+        assert_eq!(response.disposition, GroupDisposition::Refused);
+        assert!(response.calls.is_empty());
+        assert!(response.problem.unwrap().contains("membership changed"));
+    }
+
+    #[test]
+    fn only_a_created_zone_gets_the_juno_ownership_record_and_can_be_synchronized() {
+        let mut inst = bridge();
+        inst.scratch.insert(HUE_ZONES.into(), json!([]));
+        let create = HueBulb.on_group(&mut inst, &request(GroupOperation::Create));
+        assert_eq!(create.disposition, GroupDisposition::Queued);
+        assert!(http(&create).url.ends_with("/clip/v2/resource/zone"));
+        assert_eq!(http(&create).method, "POST");
+        let posted: Value = serde_json::from_str(http(&create).body.as_deref().unwrap()).unwrap();
+        let created_name = posted.pointer("/metadata/name").unwrap().as_str().unwrap();
+        assert!(created_name.contains("[Juno 0000001E]"));
+
+        let mut created = Args::new();
+        created.insert("method".into(), json!("POST"));
+        created.insert(
+            "url".into(),
+            json!("https://192.0.2.1/clip/v2/resource/zone"),
+        );
+        created.insert("status".into(), json!(200));
+        created.insert(
+            "body".into(),
+            json!({ "data": [{ "rid": ZONE, "rtype": "zone" }] }),
+        );
+        let refresh = HueBulb.on_event(&mut inst, 0, "http_response", &created);
+        assert_eq!(refresh.len(), 1);
+
+        let mut inventory = Args::new();
+        inventory.insert("method".into(), json!("GET"));
+        inventory.insert(
+            "url".into(),
+            json!("https://192.0.2.1/clip/v2/resource/zone"),
+        );
+        inventory.insert("status".into(), json!(200));
+        inventory.insert(
+            "body".into(),
+            json!({ "data": [{
+                "id": ZONE,
+                "type": "zone",
+                "metadata": { "name": created_name },
+                "children": [
+                    { "rid": "light-a", "rtype": "light" },
+                    { "rid": "light-b", "rtype": "light" }
+                ],
+                "services": [{ "rid": GROUPED, "rtype": "grouped_light" }]
+            }] }),
+        );
+        HueBulb.on_event(&mut inst, 0, "http_response", &inventory);
+        assert_eq!(group_link(&inst, 30).unwrap()["ownership"], json!("juno"));
+
+        let sync = HueBulb.on_group(&mut inst, &request(GroupOperation::Synchronize));
+        assert_eq!(sync.disposition, GroupDisposition::Queued);
+        assert_eq!(http(&sync).method, "PUT");
+        assert!(http(&sync).url.ends_with(&format!("/resource/zone/{ZONE}")));
     }
 }

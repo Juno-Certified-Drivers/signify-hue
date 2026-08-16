@@ -2,7 +2,7 @@
 id = "signify.hue.bulb"
 name = "Philips Hue Bulb"
 manufacturer = "Signify"
-version = "1.2.0"
+version = "1.3.0"
 runtime = "wasm"
 # Bulbs live behind a bridge and inherit its address and key.
 parent = "signify.hue.bridge"

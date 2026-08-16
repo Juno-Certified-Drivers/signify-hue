@@ -2,8 +2,10 @@
 id = "signify.hue.bridge"
 name = "Philips Hue Bridge"
 manufacturer = "Signify"
-version = "1.2.0"
+version = "1.3.0"
 runtime = "wasm"
+# Core may ask the bridge to replace per-bulb fan-out with one Hue grouped_light request.
+group_control = true
 
 # The bridge is a device in its own right. It holds the address and the paired key once, and
 # every bulb behind it reads them from here — so a bridge that moves to a new IP is edited in
