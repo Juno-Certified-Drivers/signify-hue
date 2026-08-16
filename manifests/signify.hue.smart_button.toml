@@ -2,7 +2,7 @@
 id = "signify.hue.smart_button"
 name = "Philips Hue Smart Button"
 manufacturer = "Signify"
-version = "1.3.0"
+version = "1.4.0"
 runtime = "wasm"
 parent = "signify.hue.bridge"
 

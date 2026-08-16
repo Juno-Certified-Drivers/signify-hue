@@ -2,7 +2,7 @@
 id = "signify.hue.bulb.on_off"
 name = "Philips Hue On/Off Light"
 manufacturer = "Signify"
-version = "1.3.0"
+version = "1.4.0"
 runtime = "native"
 parent = "signify.hue.bridge"
 

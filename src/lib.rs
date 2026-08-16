@@ -29,6 +29,7 @@ use driver_sdk::{Value, json};
 
 mod button;
 mod catalog;
+mod scene;
 mod sensor;
 
 #[derive(Default)]
@@ -52,7 +53,11 @@ enum Role {
 
 impl Role {
     fn of(inst: &Instance) -> Role {
-        let has = |property: &str| inst.property(property).as_str().is_some_and(|s| !s.is_empty());
+        let has = |property: &str| {
+            inst.property(property)
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        };
         if has("Light id") {
             Role::Bulb
         } else if has("Motion id") {
@@ -67,14 +72,22 @@ impl Role {
     /// Every binding this device has, so all of them can be brought online at bind rather than
     /// binding 1 alone. A multi-sensor whose temperature never came online reads as a broken probe.
     fn bindings(self, inst: &Instance) -> Vec<LocalId> {
-        let set = |property: &str| inst.property(property).as_str().is_some_and(|s| !s.is_empty());
+        let set = |property: &str| {
+            inst.property(property)
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        };
         match self {
             Role::Bridge | Role::Bulb => vec![1],
-            Role::Motion => [("Motion id", 1), ("Temperature id", 2), ("Light level id", 3)]
-                .iter()
-                .filter(|(p, _)| set(p))
-                .map(|(_, id)| *id)
-                .collect(),
+            Role::Motion => [
+                ("Motion id", 1),
+                ("Temperature id", 2),
+                ("Light level id", 3),
+            ]
+            .iter()
+            .filter(|(p, _)| set(p))
+            .map(|(_, id)| *id)
+            .collect(),
             Role::Control => [
                 ("Button 1 id", 1),
                 ("Button 2 id", 2),
@@ -197,6 +210,11 @@ const AT_START: &[&str] = &[
     // Zones are inventory, not Juno-owned configuration. Reading them lets a logical group use
     // an exact existing match without ever renaming it or changing its members.
     "zone",
+    // Native scenes can belong to rooms or zones. These inventories are read once so publishing
+    // can select an exact existing scope without modifying it, and borrowed scenes can be
+    // validated before recall.
+    "room",
+    "scene",
 ];
 
 const HUE_BRIDGE_ID: &str = "hue_bridge_id";
@@ -205,12 +223,7 @@ const HUE_GROUP_LINKS: &str = "hue_group_links";
 const HUE_GROUP_PENDING: &str = "hue_group_pending";
 const HUE_GROUP_PROBLEM: &str = "hue_group_problem";
 
-fn bridge_http(
-    inst: &Instance,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> Option<HostCall> {
+fn bridge_http(inst: &Instance, method: &str, path: &str, body: Option<Value>) -> Option<HostCall> {
     let bridge = inst.property("Bridge address").as_str()?;
     let key = inst.property("Application key").as_str().unwrap_or("");
     if bridge.is_empty() {
@@ -381,8 +394,7 @@ fn group_status(inst: &Instance, request: &GroupRequest) -> Value {
     let linked = link.map(|mut link| {
         let valid = linked_zone.is_some_and(|zone| {
             zone_light_ids(zone) == desired
-                && zone_grouped_light(zone)
-                    == link.get("grouped_light").and_then(Value::as_str)
+                && zone_grouped_light(zone) == link.get("grouped_light").and_then(Value::as_str)
                 && bridge_id(inst) == link.get("bridge_id").and_then(Value::as_str)
         });
         if let Some(object) = link.as_object_mut() {
@@ -475,7 +487,11 @@ fn grouped_command(
             let hue = args.get("hue").and_then(Value::as_f64).unwrap_or(0.0);
             let sat = args.get("sat").and_then(Value::as_f64).unwrap_or(0.0);
             let (x, y) = hs_to_xy(hue, sat);
-            (json!({ "color": { "xy": { "x": x, "y": y } } }), None, false)
+            (
+                json!({ "color": { "xy": { "x": x, "y": y } } }),
+                None,
+                false,
+            )
         }
         "ramp_start" | "ramp_stop" => {
             let up = args.get("direction").and_then(Value::as_str) == Some("up");
@@ -532,15 +548,12 @@ fn grouped_command(
     Ok((body, members))
 }
 
-fn validated_grouped_light(
-    inst: &Instance,
-    request: &GroupRequest,
-) -> Result<String, String> {
+fn validated_grouped_light(inst: &Instance, request: &GroupRequest) -> Result<String, String> {
     let desired = group_light_ids(request)?;
     let link = group_link(inst, request.group)
         .ok_or_else(|| "this Juno group is not linked to a Hue zone".to_string())?;
-    let current_bridge = bridge_id(inst)
-        .ok_or_else(|| "the Hue bridge identity has not loaded yet".to_string())?;
+    let current_bridge =
+        bridge_id(inst).ok_or_else(|| "the Hue bridge identity has not loaded yet".to_string())?;
     if link.get("bridge_id").and_then(Value::as_str) != Some(current_bridge) {
         return Err("the saved zone belongs to a different Hue bridge".into());
     }
@@ -643,9 +656,12 @@ impl HueBulb {
             return None;
         }
         Some(HostCall::Http(
-            HttpRequest::new("PUT", format!("https://{bridge}/clip/v2/resource/light/{id}"))
-                .header("hue-application-key", key)
-                .json(body.to_string()),
+            HttpRequest::new(
+                "PUT",
+                format!("https://{bridge}/clip/v2/resource/light/{id}"),
+            )
+            .header("hue-application-key", key)
+            .json(body.to_string()),
         ))
     }
 
@@ -674,11 +690,25 @@ impl HueBulb {
 
         let mut out = Vec::new();
         let mut zone_changed = false;
+        let mut scene_changed = false;
+        let mut room_changed = false;
         for update in frame.as_array().into_iter().flatten() {
-            let kind = update.get("type").and_then(Value::as_str).unwrap_or("update");
-            for resource in update.get("data").and_then(Value::as_array).into_iter().flatten() {
+            let kind = update
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("update");
+            for resource in update
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 zone_changed |= resource.get("type").and_then(Value::as_str) == Some("zone")
                     || resource.get("rtype").and_then(Value::as_str) == Some("zone");
+                scene_changed |= resource.get("type").and_then(Value::as_str) == Some("scene")
+                    || resource.get("rtype").and_then(Value::as_str) == Some("scene");
+                room_changed |= resource.get("type").and_then(Value::as_str) == Some("room")
+                    || resource.get("rtype").and_then(Value::as_str) == Some("room");
                 out.extend(Self::mine(inst, kind, resource));
             }
         }
@@ -688,6 +718,18 @@ impl HueBulb {
         if Role::of(inst) == Role::Bridge
             && zone_changed
             && let Some(call) = bridge_http(inst, "GET", "/clip/v2/resource/zone", None)
+        {
+            out.push(call);
+        }
+        if Role::of(inst) == Role::Bridge
+            && scene_changed
+            && let Some(call) = bridge_http(inst, "GET", "/clip/v2/resource/scene", None)
+        {
+            out.push(call);
+        }
+        if Role::of(inst) == Role::Bridge
+            && room_changed
+            && let Some(call) = bridge_http(inst, "GET", "/clip/v2/resource/room", None)
         {
             out.push(call);
         }
@@ -787,11 +829,21 @@ impl HueBulb {
     /// the remembered value fills it in — reading it as zero would darken the bulb on screen
     /// every time somebody changed its colour.
     fn report(inst: &mut Instance, light: &Value) -> Vec<HostCall> {
+        // The startup light collection is also the requested one-time effects_v2 re-scan. Each
+        // adopted bulb keeps only its own advertised values for later scene validation.
+        scene::cache_effects_v2(inst, light);
         let mut out = Vec::new();
-        let known_level = inst.scratch.get("level").and_then(Value::as_u64).unwrap_or(100);
+        let known_level = inst
+            .scratch
+            .get("level")
+            .and_then(Value::as_u64)
+            .unwrap_or(100);
         let known_on = inst.scratch.get("on").and_then(Value::as_bool);
 
-        let on = light.pointer("/on/on").and_then(Value::as_bool).or(known_on);
+        let on = light
+            .pointer("/on/on")
+            .and_then(Value::as_bool)
+            .or(known_on);
         let brightness = light
             .pointer("/dimming/brightness")
             .and_then(Value::as_f64)
@@ -889,7 +941,13 @@ impl DriverModule for HueBulb {
                     .get("on")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let next = if cur { 0 } else if last == 0 { 100 } else { last };
+                let next = if cur {
+                    0
+                } else if last == 0 {
+                    100
+                } else {
+                    last
+                };
                 (power_body(!cur, ramp), Some(next))
             }
             "set_level" => {
@@ -984,7 +1042,10 @@ impl DriverModule for HueBulb {
                     );
                 }
                 let Some(grouped_light) = zone_grouped_light(&zone).map(str::to_string) else {
-                    return refused("that Hue zone cannot control its lights as a group", status());
+                    return refused(
+                        "that Hue zone cannot control its lights as a group",
+                        status(),
+                    );
                 };
                 set_group_link(
                     inst,
@@ -1157,6 +1218,10 @@ impl DriverModule for HueBulb {
         }
     }
 
+    fn on_scene(&self, inst: &mut Instance, request: &SceneRequest) -> SceneResponse {
+        scene::handle(inst, request)
+    }
+
     /// Ask the bridge where this bulb actually is, rather than assuming.
     ///
     /// Without this a freshly adopted light shows no state until someone commands it, which
@@ -1262,6 +1327,9 @@ impl DriverModule for HueBulb {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("");
             let status = args.get("status").and_then(Value::as_u64).unwrap_or(200);
             if url.contains("/clip/v2/resource/zone") {
+                if scene::zone_write_pending(inst) {
+                    return scene::on_zone_response(inst, args);
+                }
                 if status >= 400 {
                     inst.scratch.insert(
                         HUE_GROUP_PROBLEM.into(),
@@ -1318,6 +1386,9 @@ impl DriverModule for HueBulb {
                     return Vec::new();
                 }
             }
+            if let Some(calls) = scene::on_collection_response(inst, args) {
+                return calls;
+            }
         }
         // CLIP v2 answers `{"errors": [], "data": [ … ]}` — one entry for a single resource,
         // everything of that type for a collection. Core hands a bridge's answer to the devices
@@ -1344,7 +1415,6 @@ impl DriverModule for HueBulb {
     }
 }
 
-
 export_driver!(HueBulb);
 
 #[cfg(test)]
@@ -1355,7 +1425,12 @@ mod pairing_tests {
         match HueBulb::offer(&resource).into_iter().next()? {
             HostCall::Notify { name, args, .. } => {
                 assert_eq!(name, "device_added");
-                let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let s = |k: &str| {
+                    args.get(k)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
                 Some((s("id"), s("name"), s("kind")))
             }
             _ => None,
@@ -1376,8 +1451,16 @@ mod pairing_tests {
             offered(device),
             Some(("b8b7-1".into(), "Porch".into(), "sultan_bulb".into()))
         );
-        for service in ["light", "zigbee_connectivity", "entertainment", "taurus_7455"] {
-            assert_eq!(HueBulb::offer(&json!({ "id": "x", "type": service })).len(), 0);
+        for service in [
+            "light",
+            "zigbee_connectivity",
+            "entertainment",
+            "taurus_7455",
+        ] {
+            assert_eq!(
+                HueBulb::offer(&json!({ "id": "x", "type": service })).len(),
+                0
+            );
         }
     }
 
@@ -1432,7 +1515,10 @@ mod pairing_tests {
                 ("Temperature id", "T1"),
                 ("Light level id", "LL1"),
             ]);
-            assert!(deleted(&mut sensor, rid, "motion"), "{rid} should remove it");
+            assert!(
+                deleted(&mut sensor, rid, "motion"),
+                "{rid} should remove it"
+            );
         }
     }
 
@@ -1456,14 +1542,16 @@ mod pairing_tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------------------
 // Setup flow
 // ---------------------------------------------------------------------------------------
 
 /// Where the flow is. Core carries this between calls; the driver stays stateless.
 fn phase(state: &Value) -> &str {
-    state.get("phase").and_then(Value::as_str).unwrap_or("start")
+    state
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("start")
 }
 
 /// Finish, asking first whether the bridge's scenes should come too.
@@ -1497,9 +1585,9 @@ fn ask_about_scenes(
         SetupStep::Form {
             title: format!("Bring over {n} scene{}?", if n == 1 { "" } else { "s" }),
             body: format!(
-                "The bridge has {n} saved — {}{}. Each is a set of levels and colours, one per \
-                 light, and they come over exactly as they are. Skipping this changes nothing \
-                 else; the lights and remotes are added either way.",
+                "The bridge has {n} saved — {}{}. They stay owned by Hue: Juno can recall them \
+                 statically or dynamically, but can never edit or delete them. Skipping this \
+                 changes nothing else; the lights and remotes are added either way.",
                 names.join(", "),
                 if n > names.len() { " and others" } else { "" }
             ),
@@ -1583,7 +1671,10 @@ impl HueBulb {
             .iter()
             .filter_map(|f| {
                 let address = f.get("address")?.as_str()?.to_string();
-                let name = f.get("name").and_then(Value::as_str).unwrap_or("Hue bridge");
+                let name = f
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Hue bridge");
                 // The advertised name is the full service instance; lead with the readable part.
                 let short = name.split('.').next().unwrap_or(name).to_string();
                 let txt = f.get("txt");
@@ -1647,9 +1738,7 @@ impl HueBulb {
         // Browsing a bridge that already exists: it has an address and a key, so go straight
         // to listing. Making someone press the link button again to add a second bulb would
         // be pointless — the pairing has not expired.
-        if phase(state) == "start"
-            && state.get("browse").and_then(Value::as_bool) == Some(true)
-        {
+        if phase(state) == "start" && state.get("browse").and_then(Value::as_bool) == Some(true) {
             let addr = state
                 .get("Bridge address")
                 .and_then(Value::as_str)
@@ -1693,10 +1782,7 @@ impl HueBulb {
                 };
                 (
                     SetupStep::Fetch {
-                        request: HttpRequest::new(
-                            "GET",
-                            format!("https://{address}/api/config"),
-                        ),
+                        request: HttpRequest::new("GET", format!("https://{address}/api/config")),
                         note: "checking the bridge".into(),
                     },
                     json!({ "phase": "probed", "address": address }),
@@ -1801,8 +1887,7 @@ impl HueBulb {
                     }
                     return (
                         SetupStep::Failed {
-                            reason: "the link button was not pressed in time — start again"
-                                .into(),
+                            reason: "the link button was not pressed in time — start again".into(),
                         },
                         Value::Null,
                     );
@@ -2138,7 +2223,11 @@ impl HueBulb {
 
             "chosen" => {
                 let address = address.unwrap_or_default();
-                let key = state.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let chosen: Vec<Candidate> = input
                     .get("chosen")
                     .and_then(|c| driver_sdk::serde_json::from_value(c.clone()).ok())
@@ -2286,7 +2375,8 @@ mod bulb_capability_tests {
         let mut inst = Instance::new(1);
         inst.properties
             .insert("Bridge address".into(), json!("192.0.2.1"));
-        inst.properties.insert("Application key".into(), json!("key"));
+        inst.properties
+            .insert("Application key".into(), json!("key"));
         inst.properties.insert("Light id".into(), json!("light"));
         inst
     }
@@ -2347,10 +2437,7 @@ mod bulb_capability_tests {
             "color_temperature": { "mirek": 366, "mirek_valid": true },
             "color": null
         });
-        assert_eq!(
-            bulb_driver(&warm_white).0,
-            "signify.hue.bulb.tunable"
-        );
+        assert_eq!(bulb_driver(&warm_white).0, "signify.hue.bulb.tunable");
     }
 }
 
@@ -2365,7 +2452,8 @@ mod grouped_zone_tests {
         let mut inst = Instance::new(10);
         inst.properties
             .insert("Bridge address".into(), json!("192.0.2.1"));
-        inst.properties.insert("Application key".into(), json!("key"));
+        inst.properties
+            .insert("Application key".into(), json!("key"));
         inst.scratch.insert(HUE_BRIDGE_ID.into(), json!("BRIDGE-A"));
         inst.scratch.insert(
             HUE_ZONES.into(),
@@ -2437,12 +2525,19 @@ mod grouped_zone_tests {
         assert_eq!(command.disposition, GroupDisposition::Handled);
         assert_eq!(command.calls.len(), 1);
         assert_eq!(command.members.len(), 2);
-        assert!(http(&command).url.ends_with(&format!("/grouped_light/{GROUPED}")));
+        assert!(
+            http(&command)
+                .url
+                .ends_with(&format!("/grouped_light/{GROUPED}"))
+        );
         assert!(!http(&command).url.contains("/resource/zone/"));
 
         let sync = HueBulb.on_group(&mut inst, &request(GroupOperation::Synchronize));
         assert_eq!(sync.disposition, GroupDisposition::Refused);
-        assert!(sync.calls.is_empty(), "a borrowed zone must never be written");
+        assert!(
+            sync.calls.is_empty(),
+            "a borrowed zone must never be written"
+        );
     }
 
     #[test]

@@ -12,7 +12,10 @@
 //! printed. Getting this wrong is not subtle: every rule in the house would be attached to the wrong
 //! button, and it would look like the remote was faulty.
 
-use driver_sdk::{Args, Candidate, ImportedAction, ImportedRule, ImportedScene, Value, json};
+use driver_sdk::{
+    Args, Candidate, ImportedAction, ImportedRule, ImportedScene, ImportedSceneResource, Value,
+    json,
+};
 use std::collections::BTreeMap;
 
 /// Every keypad is one binding, keys and dial alike. See `keypad.toml`.
@@ -121,7 +124,9 @@ pub fn order_buttons(catalog: &mut [Value], response: Option<&Value>) {
         for button in data {
             let (Some(id), Some(n)) = (
                 button.get("id").and_then(Value::as_str),
-                button.pointer("/metadata/control_id").and_then(Value::as_u64),
+                button
+                    .pointer("/metadata/control_id")
+                    .and_then(Value::as_u64),
             ) else {
                 continue;
             };
@@ -361,7 +366,12 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
             .filter(|p| !p.is_empty())
             .map(str::to_string);
         let model = device.get("model").and_then(Value::as_str).unwrap_or("");
-        let rid = |field: &str| device.get(field).and_then(Value::as_str).map(str::to_string);
+        let rid = |field: &str| {
+            device
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         let controls: Vec<String> = device
             .get("controls")
             .and_then(Value::as_array)
@@ -669,7 +679,10 @@ pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedSc
                     rooms.push(room);
                 }
                 let body = action.get("action")?;
-                let on = body.pointer("/on/on").and_then(Value::as_bool).unwrap_or(true);
+                let on = body
+                    .pointer("/on/on")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 let brightness = body.pointer("/dimming/brightness").and_then(Value::as_f64);
 
                 // Off is a level of nothing rather than an `off`, so one step per light says the
@@ -710,6 +723,17 @@ pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedSc
                 title,
                 rooms,
                 steps,
+                native: Some(ImportedSceneResource {
+                    resource: scene.get("id")?.as_str()?.to_string(),
+                    dynamic_palette: ["color", "effects"]
+                        .into_iter()
+                        .any(|kind| {
+                            scene
+                                .pointer(&format!("/palette/{kind}"))
+                                .and_then(Value::as_array)
+                                .is_some_and(|values| !values.is_empty())
+                        }),
+                }),
             })
         })
         .collect()
@@ -746,11 +770,12 @@ mod tests {
             ])),
         ]});
         let catalog = compact(Some(&response));
-        let names: Vec<&str> = catalog
-            .iter()
-            .filter_map(|d| d["name"].as_str())
-            .collect();
-        assert_eq!(names, vec!["Kitchen bulb", "Hall sensor"], "the bridge is not a device");
+        let names: Vec<&str> = catalog.iter().filter_map(|d| d["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Kitchen bulb", "Hall sensor"],
+            "the bridge is not a device"
+        );
 
         let offered: Vec<String> = candidates(&catalog, "10.0.0.2", "key")
             .into_iter()
@@ -822,9 +847,21 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                (json!(1), vec!["clicked".into()], "all_lights_on".to_string()),
-                (json!(2), vec!["clicked".into(), "repeating".into()], "dim_up".into()),
-                (json!(3), vec!["clicked".into(), "repeating".into()], "dim_down".into()),
+                (
+                    json!(1),
+                    vec!["clicked".into()],
+                    "all_lights_on".to_string()
+                ),
+                (
+                    json!(2),
+                    vec!["clicked".into(), "repeating".into()],
+                    "dim_up".into()
+                ),
+                (
+                    json!(3),
+                    vec!["clicked".into(), "repeating".into()],
+                    "dim_down".into()
+                ),
                 (json!(4), vec!["clicked".into()], "all_lights_off".into()),
             ]
         );
@@ -851,17 +888,22 @@ mod tests {
             Candidate {
                 label: "Lamp".into(),
                 room: "Lounge".into(),
-                properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+                properties: [("Light id".to_string(), json!("l1"))]
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             },
             Candidate {
                 label: "Downlight".into(),
                 room: "Kitchen".into(),
-                properties: [("Light id".to_string(), json!("l2"))].into_iter().collect(),
+                properties: [("Light id".to_string(), json!("l2"))]
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             },
         ];
         let response = json!({ "data": [{
+            "id": "scene-relax",
             "metadata": { "name": "Relax" },
             "group": { "rid": "room-1", "rtype": "room" },
             "actions": [
@@ -881,9 +923,19 @@ mod tests {
         let made = scenes(Some(&response), &offered);
         assert_eq!(made.len(), 1);
         assert_eq!(made[0].title, "Relax");
+        assert_eq!(
+            made[0]
+                .native
+                .as_ref()
+                .map(|native| native.resource.as_str()),
+            Some("scene-relax")
+        );
         // Read off the lights it touches rather than the group it names, which is what makes a
         // zone scene land on the rooms it actually covers without asking the bridge for zones.
-        assert_eq!(made[0].rooms, vec!["Lounge".to_string(), "Kitchen".to_string()]);
+        assert_eq!(
+            made[0].rooms,
+            vec!["Lounge".to_string(), "Kitchen".to_string()]
+        );
 
         let steps: Vec<(usize, String, Value)> = made[0]
             .steps
@@ -921,7 +973,9 @@ mod tests {
     fn a_scene_with_no_adopted_lights_is_dropped() {
         let offered = vec![Candidate {
             label: "Lamp".into(),
-            properties: [("Light id".to_string(), json!("l1"))].into_iter().collect(),
+            properties: [("Light id".to_string(), json!("l1"))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         }];
         let response = json!({ "data": [{
@@ -975,7 +1029,10 @@ mod tests {
         apply_behaviours(&mut catalog, Some(&behaviours), &names);
 
         let offered = candidates(&catalog, "10.0.0.2", "key");
-        assert_eq!(offered[0].room, "Kitchen", "it goes where the thing it drives is");
+        assert_eq!(
+            offered[0].room, "Kitchen",
+            "it goes where the thing it drives is"
+        );
         assert!(
             offered[0].verified.contains("controls Kitchen"),
             "and says so in the list: {}",
