@@ -3,7 +3,7 @@ id = "signify.hue.bulb.color"
 name = "Philips Hue Colour Bulb"
 manufacturer = "Signify"
 version = "1.4.0"
-runtime = "native"
+runtime = "wasm"
 parent = "signify.hue.bridge"
 
 [[proxy]]
