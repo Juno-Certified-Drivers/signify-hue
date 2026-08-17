@@ -48,6 +48,71 @@ fn has_dynamic_palette(scene: &Value) -> bool {
             .is_some_and(|effects| !effects.is_empty())
 }
 
+/// Convert Hue's current scene inventory into read-only runtime imports.
+///
+/// The stable light resource id is the join key Core can resolve against already-adopted child
+/// devices. Provider animation is never translated into a Core update loop: the stored handle is
+/// recalled by Hue scene id, and these steps are only a static preview/topology description.
+fn borrowed_scene_snapshots(scenes: &[Value]) -> Vec<BorrowedSceneSnapshot> {
+    scenes
+        .iter()
+        // A Hue scene created by Juno carries both a visible name token and this appdata marker.
+        // Never re-import it as borrowed, even if the local ownership record was lost: ambiguity
+        // must remove write authority, not manufacture a second scene with the wrong authority.
+        .filter(|scene| {
+            !scene
+                .pointer("/metadata/appdata")
+                .and_then(Value::as_str)
+                .is_some_and(|appdata| appdata.starts_with("juno:"))
+        })
+        .filter_map(|scene| {
+            let title = scene_name(scene).to_string();
+            let resource = scene.get("id")?.as_str()?.to_string();
+            let mut steps = Vec::new();
+            for action in scene.get("actions").and_then(Value::as_array)? {
+                let light = action.pointer("/target/rid")?.as_str()?.to_string();
+                let body = action.get("action")?;
+                let on = body
+                    .pointer("/on/on")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let brightness = body.pointer("/dimming/brightness").and_then(Value::as_f64);
+                let level = match (on, brightness) {
+                    (false, _) => 0,
+                    (true, Some(value)) => value.round().clamp(1.0, 100.0) as u64,
+                    (true, None) => 100,
+                };
+                let properties = BTreeMap::from([("Light id".to_string(), json!(light))]);
+                steps.push(BorrowedSceneStep {
+                    properties: properties.clone(),
+                    proxy: 1,
+                    command: "set_level".into(),
+                    args: BTreeMap::from([("level".to_string(), json!(level))]),
+                });
+                if on
+                    && let Some(mirek) = body
+                        .pointer("/color_temperature/mirek")
+                        .and_then(Value::as_u64)
+                        .filter(|mirek| *mirek > 0)
+                {
+                    steps.push(BorrowedSceneStep {
+                        properties,
+                        proxy: 1,
+                        command: "set_cct".into(),
+                        args: BTreeMap::from([("kelvin".to_string(), json!(1_000_000 / mirek))]),
+                    });
+                }
+            }
+            (!steps.is_empty()).then_some(BorrowedSceneSnapshot {
+                title,
+                resource,
+                dynamic_palette: has_dynamic_palette(scene),
+                steps,
+            })
+        })
+        .collect()
+}
+
 fn scene_link(inst: &Instance, scene: u32) -> Option<Value> {
     inst.scratch
         .get(HUE_SCENE_LINKS)
@@ -851,7 +916,13 @@ pub(crate) fn on_collection_response(inst: &mut Instance, args: &Args) -> Option
     {
         inst.scratch.insert(HUE_SCENES.into(), json!(data));
         finalize_pending(inst);
-        return Some(Vec::new());
+        let scenes = borrowed_scene_snapshots(data);
+        return Some(
+            (!scenes.is_empty())
+                .then_some(HostCall::BorrowedScenes { scenes })
+                .into_iter()
+                .collect(),
+        );
     }
     Some(Vec::new())
 }
@@ -933,6 +1004,45 @@ mod tests {
             .insert("Application key".into(), json!("secret"));
         inst.scratch.insert(HUE_BRIDGE_ID.into(), json!("BRIDGE-A"));
         inst
+    }
+
+    #[test]
+    fn runtime_scene_inventory_imports_only_hue_owned_resources() {
+        let scenes = vec![
+            json!({
+                "id": "hue-relax",
+                "metadata": { "name": "Relax" },
+                "palette": { "color": [{ "color": { "xy": { "x": 0.4, "y": 0.3 } } }] },
+                "actions": [{
+                    "target": { "rid": "light-one", "rtype": "light" },
+                    "action": {
+                        "on": { "on": true },
+                        "dimming": { "brightness": 37.0 },
+                        "color_temperature": { "mirek": 250 }
+                    }
+                }]
+            }),
+            json!({
+                "id": "juno-owned",
+                "metadata": { "name": "Evening [Juno 00000007]", "appdata": "juno:00000007" },
+                "actions": [{
+                    "target": { "rid": "light-one", "rtype": "light" },
+                    "action": { "dimming": { "brightness": 10.0 } }
+                }]
+            }),
+        ];
+        let imported = borrowed_scene_snapshots(&scenes);
+        assert_eq!(imported.len(), 1, "Juno-owned scenes stay Juno-owned");
+        assert_eq!(imported[0].resource, "hue-relax");
+        assert_eq!(imported[0].title, "Relax");
+        assert!(imported[0].dynamic_palette);
+        assert_eq!(imported[0].steps.len(), 2);
+        assert_eq!(
+            imported[0].steps[0].properties.get("Light id"),
+            Some(&json!("light-one"))
+        );
+        assert_eq!(imported[0].steps[0].args.get("level"), Some(&json!(37)));
+        assert_eq!(imported[0].steps[1].args.get("kelvin"), Some(&json!(4000)));
     }
 
     fn borrowed(operation: SceneOperation) -> SceneRequest {
