@@ -159,20 +159,59 @@ pub fn order_buttons(catalog: &mut [Value], response: Option<&Value>) {
 /// Rooms rather than zones, because a Hue room is exclusive — a device is in exactly one — and a
 /// zone is not. "Downstairs" and "Evening" are both zones and neither is where a lamp *is*.
 pub fn assign_rooms(catalog: &mut [Value], response: Option<&Value>) {
-    let mut of_device: BTreeMap<String, String> = BTreeMap::new();
+    let mut of_child: BTreeMap<String, String> = BTreeMap::new();
     for room in rooms(response) {
         for child in room.children {
-            of_device.insert(child, room.name.clone());
+            of_child.insert(child, room.name.clone());
         }
     }
     for device in catalog.iter_mut() {
-        let Some(id) = device.get("id").and_then(Value::as_str) else {
-            continue;
+        // A room's children are *devices*; a zone's are the light *services* inside them. Both
+        // are how somebody groups lights in the Hue app and both come through here, so a device
+        // is claimed by either its own id or by any of the lights it owns.
+        //
+        // Matching only the device id meant a house organised into zones — or a room whose
+        // firmware lists services — came through with every bulb unplaced, and the room somebody
+        // had already filed all of it under in the Hue app was thrown away.
+        let by_device = device
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| of_child.get(id));
+        let by_light = || {
+            device
+                .get("lights")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .find_map(|light| of_child.get(light))
         };
-        if let Some(name) = of_device.get(id) {
+        // A room set first stays: `assign_rooms` is called once per grouping resource, and the
+        // room a device is *in* is a better answer than a zone it also belongs to.
+        if device.get("room").and_then(Value::as_str).is_some_and(|r| !r.is_empty()) {
+            continue;
+        }
+        if let Some(name) = by_device.cloned().or_else(|| by_light().cloned()) {
             device["room"] = json!(name);
         }
     }
+}
+
+/// Two `{id: name}` maps into one, with the first winning.
+///
+/// Rooms and zones are both groupings a person made and both are offered as places to file a
+/// device; where an id somehow appears in both, the room is the one that says where the thing
+/// physically is.
+pub fn merge_names(first: Option<&Value>, second: Value) -> Value {
+    let mut out = first
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(more) = second.as_object() {
+        for (id, name) in more {
+            out.entry(id.clone()).or_insert_with(|| name.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 /// Room resource id to room name, as a plain object so it can ride in the setup state.
@@ -737,6 +776,73 @@ pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedSc
             })
         })
         .collect()
+}
+
+
+#[cfg(test)]
+mod room_chain_tests {
+    use super::*;
+
+    /// A bulb's room, the whole way: light service → the device that owns it → the room that
+    /// holds that device. Shapes are CLIP v2's, with a room's `children` being *devices*.
+    #[test]
+    fn a_lights_room_is_found_through_the_device_that_owns_it() {
+        let devices = json!({ "data": [
+            { "id": "dev-1", "metadata": { "name": "Left Lamp" },
+              "product_data": { "product_name": "Hue color lamp" },
+              "services": [ { "rtype": "light", "rid": "light-1" } ] }
+        ]});
+        let mut found = compact(Some(&devices));
+        assert_eq!(found.len(), 1, "the bulb's device is kept");
+
+        let rooms = json!({ "data": [
+            { "id": "room-1", "metadata": { "name": "Living Room" },
+              "children": [ { "rid": "dev-1", "rtype": "device" } ] }
+        ]});
+        assign_rooms(&mut found, Some(&rooms));
+
+        assert_eq!(room_of_light(&found, "light-1").as_deref(), Some("Living Room"));
+    }
+
+    /// The same, for a house organised into zones — whose children are light services rather
+    /// than devices. Every bulb used to come through unplaced.
+    #[test]
+    fn a_zone_naming_light_services_places_its_bulbs_too() {
+        let devices = json!({ "data": [
+            { "id": "dev-1", "metadata": { "name": "Left Lamp" },
+              "product_data": { "product_name": "Hue color lamp" },
+              "services": [ { "rtype": "light", "rid": "light-1" } ] }
+        ]});
+        let mut found = compact(Some(&devices));
+
+        let zones = json!({ "data": [
+            { "id": "zone-1", "metadata": { "name": "Living Room" },
+              "children": [ { "rid": "light-1", "rtype": "light" } ] }
+        ]});
+        assign_rooms(&mut found, Some(&zones));
+
+        assert_eq!(room_of_light(&found, "light-1").as_deref(), Some("Living Room"));
+    }
+
+    /// A room wins over a zone the same bulb is also in: it is where the bulb *is*.
+    #[test]
+    fn a_room_already_set_is_not_replaced_by_a_zone() {
+        let devices = json!({ "data": [
+            { "id": "dev-1", "metadata": { "name": "Left Lamp" },
+              "product_data": { "product_name": "Hue color lamp" },
+              "services": [ { "rtype": "light", "rid": "light-1" } ] }
+        ]});
+        let mut found = compact(Some(&devices));
+        assign_rooms(&mut found, Some(&json!({ "data": [
+            { "id": "room-1", "metadata": { "name": "Kitchen" },
+              "children": [ { "rid": "dev-1", "rtype": "device" } ] }
+        ]})));
+        assign_rooms(&mut found, Some(&json!({ "data": [
+            { "id": "zone-1", "metadata": { "name": "Downstairs" },
+              "children": [ { "rid": "light-1", "rtype": "light" } ] }
+        ]})));
+        assert_eq!(room_of_light(&found, "light-1").as_deref(), Some("Kitchen"));
+    }
 }
 
 #[cfg(test)]

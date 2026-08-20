@@ -2060,6 +2060,55 @@ impl HueBulb {
                     SetupStep::Fetch {
                         request: HttpRequest::new(
                             "GET",
+                            format!("https://{address}/clip/v2/resource/zone"),
+                        )
+                        .header("hue-application-key", &key),
+                        note: "reading the zones".into(),
+                    },
+                    json!({
+                        "phase": "zones",
+                        "address": address,
+                        "key": key,
+                        "catalog": found,
+                        "rooms": names,
+                        "browse": state.get("browse").and_then(Value::as_bool).unwrap_or(false),
+                        "parent": state.get("parent"),
+                    }),
+                )
+            }
+
+            // The other way somebody groups lights in the Hue app.
+            //
+            // A room holds *devices* and is where a bulb physically is; a zone holds light
+            // *services* and is any grouping somebody wanted — "Downstairs", "Lamps". Plenty of
+            // houses use only zones, and reading rooms alone brought every one of those in
+            // unplaced, throwing away filing somebody had already done once.
+            //
+            // Rooms are applied first and are not overwritten: where a bulb is beats what it has
+            // been grouped with.
+            "zones" => {
+                let address = address.unwrap_or_default();
+                let key = state
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut found: Vec<Value> = state
+                    .get("catalog")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                catalog::assign_rooms(&mut found, input.get("response"));
+                // A zone's name is worth offering as a room to file things under, the same as a
+                // room's — it is what somebody called that group.
+                let names = catalog::merge_names(
+                    state.get("rooms"),
+                    catalog::room_names(input.get("response")),
+                );
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "GET",
                             format!("https://{address}/clip/v2/resource/behavior_instance"),
                         )
                         .header("hue-application-key", &key),
