@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "driver-sdk"
 version = "0.15.1"
-source = "git+https://github.com/junohouse/driver-sdk?branch=main#2fe600ce4419a1d68d78f415db8b9fbb90a8e1f6"
+source = "git+https://github.com/junohouse/driver-sdk?branch=main#234561d01b149bdf0b43af8ede08e63a0d679990"
 dependencies = [
  "serde",
  "serde_json",

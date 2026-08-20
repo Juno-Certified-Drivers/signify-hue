@@ -855,16 +855,20 @@ impl HueBulb {
             inst.scratch.insert("level".into(), json!(level));
         }
 
-        if on.is_some() || brightness.is_some() {
-            let level = match on {
-                Some(false) => 0,
-                _ => brightness.unwrap_or(known_level),
-            };
-            if level > 0 {
-                inst.scratch.insert("level".into(), json!(level));
-            }
-            inst.scratch.insert("on".into(), json!(level > 0));
-
+        if let Some(on) = on {
+            // Said outright rather than left to be inferred from the level. A Hue bulb keeps the
+            // brightness it will return to while it is off, so the two are genuinely separate
+            // here and core cannot work one out from the other: reporting brightness 47 for a
+            // lamp somebody just switched off used to turn it back on on screen.
+            inst.scratch.insert("on".into(), json!(on));
+            let mut a = Args::new();
+            a.insert("on".into(), json!(on));
+            out.push(HostCall::notify(1, "power_changed", a));
+        }
+        if let Some(level) = brightness.or_else(|| on.map(|_| known_level)) {
+            // The brightness the bulb holds, which is what it will come back at. Power is the
+            // other notification's business now, so this no longer reports zero to mean off.
+            inst.scratch.insert("level".into(), json!(level));
             let mut a = Args::new();
             a.insert("level".into(), json!(level));
             out.push(HostCall::notify(1, "level_changed", a));
@@ -898,9 +902,20 @@ impl HueBulb {
     /// state the intent now and let the next poll correct us if the bridge disagreed — which
     /// is what every Hue integration worth using does.
     fn optimistic(level: u8) -> Vec<HostCall> {
+        // Power as well as brightness, since core no longer infers one from the other. Without
+        // this the tile waits a bridge round trip to show a lamp somebody just switched off —
+        // and `level_changed` alone would now leave it reading "on" the whole time.
+        let mut power = Args::new();
+        power.insert("on".into(), json!(level > 0));
         let mut args = Args::new();
         args.insert("level".into(), json!(level));
-        vec![HostCall::notify(1, "level_changed", args)]
+        let mut out = vec![HostCall::notify(1, "power_changed", power)];
+        // A level of zero is "off", not "will return at nothing" — leave the remembered
+        // brightness alone so the next plain `on` restores it.
+        if level > 0 {
+            out.push(HostCall::notify(1, "level_changed", args));
+        }
+        out
     }
 }
 
@@ -1417,6 +1432,60 @@ impl DriverModule for HueBulb {
 
 export_driver!(HueBulb);
 
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+
+    fn inst() -> Instance {
+        let mut inst = Instance::default();
+        inst.properties.insert("Bridge address".into(), json!("10.0.0.2"));
+        inst.properties.insert("Application key".into(), json!("k"));
+        inst.properties.insert("Light id".into(), json!("l1"));
+        inst
+    }
+
+    fn notes(calls: &[HostCall]) -> Vec<(String, Args)> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                HostCall::Notify { name, args, .. } => Some((name.clone(), args.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A bulb switched off in the Hue app still reports the brightness it will return to.
+    /// Core used to infer power from that level and turn the lamp back on on screen.
+    #[test]
+    fn an_off_bulb_reports_off_and_keeps_its_brightness() {
+        let mut inst = inst();
+        let light = json!({ "on": { "on": false }, "dimming": { "brightness": 47.0 } });
+        let said = notes(&HueBulb::report(&mut inst, &light));
+
+        let power = said.iter().find(|(n, _)| n == "power_changed").expect("says it is off");
+        assert_eq!(power.1.get("on"), Some(&json!(false)));
+
+        let level = said.iter().find(|(n, _)| n == "level_changed").expect("and how bright");
+        assert_eq!(
+            level.1.get("level"),
+            Some(&json!(47)),
+            "the level it will come back at, not zero standing in for off",
+        );
+    }
+
+    #[test]
+    fn an_on_bulb_reports_on() {
+        let mut inst = inst();
+        let light = json!({ "on": { "on": true }, "dimming": { "brightness": 80.0 } });
+        let said = notes(&HueBulb::report(&mut inst, &light));
+        assert_eq!(
+            said.iter().find(|(n, _)| n == "power_changed").unwrap().1.get("on"),
+            Some(&json!(true)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod pairing_tests {
     use super::*;
@@ -1817,10 +1886,9 @@ impl HueBulb {
                 (
                     SetupStep::Instruct {
                         title: format!("Press the link button on {name}"),
-                        body: "The round button on top of the bridge. This is how the bridge \
-                               confirms someone with physical access approved this — there is \
-                               no way around it."
-                            .into(),
+                        // Short on purpose. Somebody is standing at the bridge with a finger
+                        // out; the reason it works this way is not what they need right now.
+                        body: "The round button on top.".into(),
                         continue_label: "I pressed it".into(),
                     },
                     json!({ "phase": "pair", "address": address, "name": name }),
@@ -2143,17 +2211,19 @@ impl HueBulb {
                             .unwrap_or("Hue light");
                         let on = light.pointer("/on/on").and_then(Value::as_bool);
                         // v2 omits `on` for a light the bridge cannot currently see.
+                        // Only worth a word when something is wrong. "The bridge reports it
+                        // on" against every row is a column of identical text beside the one
+                        // thing that tells them apart, which is the name.
                         let state = match on {
-                            Some(true) => "bridge reports it on",
-                            Some(false) => "bridge reports it off",
-                            None => "bridge cannot reach it — is it powered?",
+                            None => "cannot be reached — is it powered?",
+                            _ => "",
                         };
                         // A Hue `light` is not necessarily a colour bulb. The manifest is the
                         // source of the controls core accepts, so this choice must happen here
                         // at import time — hiding a colour wheel in the UI would still let a
                         // rule send `set_color` to a white bulb. `null` is not a capability;
                         // the bridge uses it for a resource it cannot describe at the moment.
-                        let (driver_id, can) = bulb_driver(light);
+                        let (driver_id, _) = bulb_driver(light);
                         Some(Candidate {
                             label: name.to_string(),
                             kind: "light".into(),
@@ -2165,7 +2235,7 @@ impl HueBulb {
                             ]
                             .into_iter()
                             .collect(),
-                            verified: format!("{can} — {state}"),
+                            verified: state.to_string(),
                             room: catalog::room_of_light(&found, id).unwrap_or_default(),
                         })
                     })
@@ -2198,11 +2268,7 @@ impl HueBulb {
                 (
                     SetupStep::Choose {
                         title,
-                        body: "Pick the ones to add. Anything the bridge cannot reach is \
-                               marked — a bulb switched off at the wall will say so. A remote or \
-                               a sensor is added as one device with a binding per button or \
-                               measurement, so a rule can trigger on exactly one of them."
-                            .into(),
+                        body: "Anything the bridge cannot reach is marked.".into(),
                         options,
                         multiple: true,
                     },
