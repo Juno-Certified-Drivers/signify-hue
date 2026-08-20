@@ -476,6 +476,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                 kind: "keypad".into(),
                 driver_id: driver_id.into(),
                 properties: properties.clone(),
+                capabilities: Default::default(),
                 verified,
                 room,
             });
@@ -499,6 +500,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
                 kind: "sensor".into(),
                 driver_id: "signify.hue.motion".into(),
                 properties,
+                capabilities: Default::default(),
                 verified: match product {
                     Some(p) => format!("{p} — reports {}", measures.join(", ")),
                     None => format!("reports {}", measures.join(", ")),

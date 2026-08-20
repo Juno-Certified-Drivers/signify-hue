@@ -11,12 +11,26 @@ version skew between a bridge and its children is invisible until something stop
 | Driver | Proxies | What it is |
 | --- | --- | --- |
 | `signify.hue.bridge` | `bridge` | The hub. Holds the connection, owns the event stream. |
-| `signify.hue.bulb` | `light` | A bulb. |
+| `signify.hue.light` | `light` | Any Hue light. What this one can do is answered per light. |
 | `signify.hue.motion` | `sensor` ×3 | Motion, temperature and light level — one binding each. |
 | `signify.hue.dimmer` | `button` ×4 | The four-button dimmer switch. |
 | `signify.hue.tap_dial` | `button` ×5 | Four buttons and the dial. |
 | `signify.hue.wall_switch` | `button` ×2 | The module behind an existing rocker. |
 | `signify.hue.smart_button` | `button` | One button. |
+
+### One light driver, not five
+
+There were five: `bulb`, `bulb.color`, `bulb.dimmable`, `bulb.tunable`, `bulb.on_off`. They
+shared every line of code and differed in one capability line each, because the resolved proxy
+contract is what core validates commands against — so a white fitting on the same manifest as a
+color one can be sent `set_color` by a rule no matter what any screen chooses to draw.
+
+They are one now, and the capabilities are answered per light instead, from what the bridge says
+each resource has: `Candidate::capabilities`. Same guarantee, and Philips is back to selling one
+thing called a light.
+
+A light adopted before this reclassifies itself the next time the bridge is browsed — same
+device, same bindings, so its room, rules and scenes are untouched.
 
 ### Why so many bindings
 

@@ -25,6 +25,7 @@
 //! key are per-device properties, so two bridges in one house need no special handling.
 
 use driver_sdk::*;
+use std::collections::BTreeMap;
 use driver_sdk::{Value, json};
 
 mod button;
@@ -2319,20 +2320,23 @@ impl HueBulb {
                         // Only worth a word when something is wrong. "The bridge reports it
                         // on" against every row is a column of identical text beside the one
                         // thing that tells them apart, which is the name.
+                        // Now that they are all one driver, what kind of light this is has to
+                        // be said somewhere — a list of forty rows called "Hue color lamp 1"
+                        // used to carry it in the driver name.
                         let state = match on {
-                            None => "cannot be reached — is it powered?",
-                            _ => "",
+                            None => "cannot be reached — is it powered?".to_string(),
+                            _ => bulb_shape(light).to_string(),
                         };
                         // A Hue `light` is not necessarily a color bulb. The manifest is the
                         // source of the controls core accepts, so this choice must happen here
                         // at import time — hiding a color wheel in the UI would still let a
                         // rule send `set_color` to a white bulb. `null` is not a capability;
                         // the bridge uses it for a resource it cannot describe at the moment.
-                        let (driver_id, _) = bulb_driver(light);
                         Some(Candidate {
                             label: name.to_string(),
                             kind: "light".into(),
-                            driver_id: driver_id.into(),
+                            driver_id: "signify.hue.light".into(),
+                            capabilities: bulb_capabilities(light),
                             properties: [
                                 ("Bridge address".to_string(), json!(address)),
                                 ("Application key".to_string(), json!(key)),
@@ -2340,7 +2344,7 @@ impl HueBulb {
                             ]
                             .into_iter()
                             .collect(),
-                            verified: state.to_string(),
+                            verified: state,
                             room: catalog::room_of_light(&found, id).unwrap_or_default(),
                         })
                     })
@@ -2448,6 +2452,7 @@ impl HueBulb {
                     ]
                     .into_iter()
                     .collect(),
+                    capabilities: Default::default(),
                     verified: format!("{} device(s) behind it", chosen.len()),
                     // A bridge lives in a cupboard and serves the whole house. Core refuses to
                     // place infrastructure anyway; saying nothing here is the same answer said
@@ -2513,21 +2518,70 @@ impl HueBulb {
     }
 }
 
-/// Select the narrowest bulb manifest for what one CLIP v2 light actually exposes.
+/// What one CLIP v2 light can actually do.
 ///
-/// The shared native module routes all of these by `Light id`, so separate manifests do not
-/// create separate driver behavior. They make the feature flags part of the resolved proxy
-/// contract: controls, automations, and API validation therefore agree on what this particular
-/// fitting can do.
-fn bulb_driver(light: &Value) -> (&'static str, &'static str) {
+/// Philips sells a light. It sells a few different ones — some take color, some only warm up
+/// and cool down, some are a switched socket with a bulb in it — but a person shopping for
+/// them, or looking at a list of drivers to install, is looking for a light. There were five
+/// manifests here, one per shape, differing in a single capability line.
+///
+/// So the shapes are answered per light instead, which is where the answer was all along: the
+/// bridge says which resources a fitting has. Absent and `null` both mean no — the bridge uses
+/// `null` for a feature it cannot describe just now, and a color gamut that might be there is
+/// not a color bulb.
+///
+/// This has to be decided here rather than hidden in a control: the resolved contract is what
+/// core validates against, so a light whose driver claims `set_color` can be sent one by a
+/// rule whatever any screen chooses to draw.
+fn bulb_capabilities(light: &Value) -> BTreeMap<String, Value> {
+    let has = |name: &str| light.get(name).and_then(Value::as_object).is_some();
+    let (dimmer, color, cct) = (has("dimming"), has("color"), has("color_temperature"));
+
+    let mut caps: BTreeMap<String, Value> = [
+        ("dimmer".to_string(), json!(dimmer)),
+        ("supports_color".to_string(), json!(color)),
+        ("supports_cct".to_string(), json!(cct)),
+        // Hue transitions over the same field it dims with, so a fitting that cannot dim
+        // cannot ramp either. 6553000ms is the v2 maximum.
+        ("supports_ramp".to_string(), json!(dimmer)),
+        ("ramp_rate_max_ms".to_string(), json!(6_553_000u32)),
+    ]
+    .into_iter()
+    .collect();
+
+    if cct {
+        // The whites this one actually spans, which is not the same on every model — a
+        // filament bulb stops well short of 6500K, and offering the rest of the strip is
+        // offering a color it will silently clamp. Mirek is reciprocal, so the minimum mirek
+        // is the *warmest* number of kelvin and the two swap over.
+        let mirek = |at: &str| {
+            light
+                .pointer(&format!("/color_temperature/mirek_schema/{at}"))
+                .and_then(Value::as_f64)
+                .filter(|m| *m > 0.0)
+                .map(|m| (1_000_000.0 / m).round() as u32)
+        };
+        caps.insert(
+            "cct_min".into(),
+            json!(mirek("mirek_maximum").unwrap_or(2000)),
+        );
+        caps.insert(
+            "cct_max".into(),
+            json!(mirek("mirek_minimum").unwrap_or(6500)),
+        );
+    }
+    caps
+}
+
+/// What to call this light's shape in a list somebody is reading.
+fn bulb_shape(light: &Value) -> &'static str {
     let has = |name: &str| light.get(name).and_then(Value::as_object).is_some();
     match (has("color"), has("color_temperature"), has("dimming")) {
-        (true, true, _) => ("signify.hue.bulb", "color and tunable white"),
-        (true, false, _) => ("signify.hue.bulb.color", "color"),
-        (false, true, true) => ("signify.hue.bulb.tunable", "tunable white"),
-        (false, true, false) => ("signify.hue.bulb.tunable", "tunable white"),
-        (false, false, true) => ("signify.hue.bulb.dimmable", "dimmable"),
-        (false, false, false) => ("signify.hue.bulb.on_off", "on/off"),
+        (true, true, _) => "color and tunable white",
+        (true, false, _) => "color",
+        (false, true, _) => "tunable white",
+        (false, false, true) => "dimmable",
+        (false, false, false) => "on/off",
     }
 }
 
@@ -2584,31 +2638,59 @@ mod bulb_capability_tests {
     }
 
     #[test]
-    fn a_white_hue_light_gets_a_manifest_without_color_commands() {
-        let white = json!({ "dimming": {} });
-        assert_eq!(bulb_driver(&white).0, "signify.hue.bulb.dimmable");
+    fn a_white_light_is_not_offered_color() {
+        let white = bulb_capabilities(&json!({ "dimming": {} }));
+        assert_eq!(white["dimmer"], json!(true));
+        assert_eq!(white["supports_color"], json!(false));
+        assert_eq!(white["supports_cct"], json!(false));
+        assert_eq!(bulb_shape(&json!({ "dimming": {} })), "dimmable");
 
-        let tunable = json!({ "dimming": {}, "color_temperature": {} });
-        assert_eq!(bulb_driver(&tunable).0, "signify.hue.bulb.tunable");
-
-        let color = json!({ "dimming": {}, "color": {} });
-        assert_eq!(bulb_driver(&color).0, "signify.hue.bulb.color");
+        let color = bulb_capabilities(&json!({ "dimming": {}, "color": {} }));
+        assert_eq!(color["supports_color"], json!(true));
     }
 
     #[test]
     fn absent_or_null_features_are_not_capabilities() {
-        let on_off = json!({ "color": null, "color_temperature": null, "dimming": null });
-        assert_eq!(bulb_driver(&on_off).0, "signify.hue.bulb.on_off");
+        // A socket with a lamp in it. Nothing but on and off, and a control surface that
+        // offers a brightness slider for it is a slider that does nothing.
+        let on_off = bulb_capabilities(
+            &json!({ "color": null, "color_temperature": null, "dimming": null }),
+        );
+        assert_eq!(on_off["dimmer"], json!(false));
+        assert_eq!(on_off["supports_color"], json!(false));
+        assert_eq!(on_off["supports_ramp"], json!(false));
 
-        // This is the shape a real warm/white Hue resource uses: the keys may be present in a
-        // generic response, but `color: null` is not a color gamut.  The concrete temperature
-        // object is the capability evidence, so this must never receive the full-color manifest.
+        // The shape a real warm-white resource uses: the keys are present in a generic
+        // response, but `color: null` is not a gamut. The concrete temperature object is the
+        // evidence, so this must never come out as a color light.
         let warm_white = json!({
             "dimming": { "brightness": 42.0 },
             "color_temperature": { "mirek": 366, "mirek_valid": true },
             "color": null
         });
-        assert_eq!(bulb_driver(&warm_white).0, "signify.hue.bulb.tunable");
+        let caps = bulb_capabilities(&warm_white);
+        assert_eq!(caps["supports_color"], json!(false));
+        assert_eq!(caps["supports_cct"], json!(true));
+        assert_eq!(bulb_shape(&warm_white), "tunable white");
+    }
+
+    #[test]
+    fn the_whites_offered_are_the_ones_this_fitting_spans() {
+        // Mirek is reciprocal: the smallest mirek is the coolest white, so the two ends swap
+        // over. Read the wrong way round a filament bulb advertises 6500K at the warm end and
+        // every white it is asked for is clamped to something else.
+        let filament = json!({
+            "dimming": {},
+            "color_temperature": { "mirek_schema": { "mirek_minimum": 222, "mirek_maximum": 454 } }
+        });
+        let caps = bulb_capabilities(&filament);
+        assert_eq!(caps["cct_min"], json!(2203), "the warmest it goes");
+        assert_eq!(caps["cct_max"], json!(4505), "and the coolest");
+
+        // A bridge that did not say gets the range Hue's own range spans.
+        let quiet = bulb_capabilities(&json!({ "dimming": {}, "color_temperature": {} }));
+        assert_eq!(quiet["cct_min"], json!(2000));
+        assert_eq!(quiet["cct_max"], json!(6500));
     }
 }
 
