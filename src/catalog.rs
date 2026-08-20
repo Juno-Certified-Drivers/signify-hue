@@ -114,7 +114,7 @@ pub fn compact(response: Option<&Value>) -> Vec<Value> {
 /// Put each device's buttons in the order they are printed on it, using `metadata.control_id`.
 ///
 /// A button the `/button` answer does not mention keeps its place at the end rather than being
-/// dropped — a remote with one unrecognised button is still worth having.
+/// dropped — a remote with one unrecognized button is still worth having.
 pub fn order_buttons(catalog: &mut [Value], response: Option<&Value>) {
     let mut control: BTreeMap<String, u64> = BTreeMap::new();
     if let Some(data) = response
@@ -170,7 +170,7 @@ pub fn assign_rooms(catalog: &mut [Value], response: Option<&Value>) {
         // are how somebody groups lights in the Hue app and both come through here, so a device
         // is claimed by either its own id or by any of the lights it owns.
         //
-        // Matching only the device id meant a house organised into zones — or a room whose
+        // Matching only the device id meant a house organized into zones — or a room whose
         // firmware lists services — came through with every bulb unplaced, and the room somebody
         // had already filed all of it under in the Hue app was thrown away.
         let by_device = device
@@ -216,7 +216,7 @@ pub fn merge_names(first: Option<&Value>, second: Value) -> Value {
 
 /// Room resource id to room name, as a plain object so it can ride in the setup state.
 ///
-/// Stashed rather than re-fetched: the behaviours step needs it and runs after the rooms step, and
+/// Stashed rather than re-fetched: the behaviors step needs it and runs after the rooms step, and
 /// asking the bridge for the same list twice to avoid carrying a dozen short strings would be the
 /// wrong trade.
 pub fn room_names(response: Option<&Value>) -> Value {
@@ -270,7 +270,7 @@ fn rooms(response: Option<&Value>) -> Vec<Group> {
 
 /// Every `{rid, rtype}` anywhere inside a value, however deeply it is nested.
 ///
-/// Deliberately structure-blind. A behaviour's `configuration` is shaped by whichever script it is
+/// Deliberately structure-blind. A behavior's `configuration` is shaped by whichever script it is
 /// an instance of, those shapes are not documented, and Signify adds new ones — so reading it by
 /// walking a known path would work for the dimmer script today and silently stop working for the
 /// next one. What every script does have in common is that it refers to things by `rid`, so that
@@ -307,17 +307,17 @@ fn referenced(value: &Value, out: &mut Vec<(String, String)>) {
 ///
 /// A suggestion either way. Nothing here imports a Hue automation as a Juno rule: the two have
 /// different semantics, and a rule the household cannot see the origin of is worse than no rule.
-pub fn apply_behaviours(catalog: &mut [Value], behaviours: Option<&Value>, room_names: &Value) {
-    let Some(data) = behaviours
+pub fn apply_behaviors(catalog: &mut [Value], behaviors: Option<&Value>, room_names: &Value) {
+    let Some(data) = behaviors
         .and_then(|r| r.get("data"))
         .and_then(Value::as_array)
     else {
         return;
     };
 
-    for behaviour in data {
+    for behavior in data {
         let mut refs = Vec::new();
-        referenced(behaviour, &mut refs);
+        referenced(behavior, &mut refs);
         let targets: Vec<String> = refs
             .iter()
             .filter(|(_, rtype)| rtype == "room")
@@ -327,7 +327,7 @@ pub fn apply_behaviours(catalog: &mut [Value], behaviours: Option<&Value>, room_
             continue;
         }
 
-        // Which of our devices this behaviour is about. Matched on the device itself or on any of
+        // Which of our devices this behavior is about. Matched on the device itself or on any of
         // its buttons, because a script may name either.
         for device in catalog.iter_mut() {
             let id = device.get("id").and_then(Value::as_str).unwrap_or("");
@@ -514,7 +514,7 @@ pub fn candidates(catalog: &[Value], address: &str, key: &str) -> Vec<Candidate>
 
 /// The rules the bridge already has, as rules this house could have.
 ///
-/// An interpretation, and worth being plain about how much of one. A Hue behaviour says *that* a
+/// An interpretation, and worth being plain about how much of one. A Hue behavior says *that* a
 /// switch drives a room; the per-button detail is buried in a script whose shape is the script's
 /// own business and changes between versions. So what is reconstructed here is the layout every
 /// Hue remote has had since the first one: top turns the room on, bottom turns it off, and the two
@@ -659,7 +659,7 @@ pub fn rules(catalog: &[Value], offered: &[Candidate]) -> Vec<ImportedRule> {
 /// The bridge's own named arrangements, as scenes this house could have.
 ///
 /// A Hue scene is the one thing on a bridge that is pure detail: five lights, each with a
-/// brightness and often a colour temperature, decided by somebody sitting in the room. Every other
+/// brightness and often a color temperature, decided by somebody sitting in the room. Every other
 /// thing here can be described again in a sentence; this cannot, which is exactly why it is worth
 /// carrying across.
 ///
@@ -740,7 +740,7 @@ pub fn scenes(response: Option<&Value>, offered: &[Candidate]) -> Vec<ImportedSc
                         .collect(),
                 });
 
-                // Colour temperature, where the scene sets one and the bulb is off no longer.
+                // Color temperature, where the scene sets one and the bulb is off no longer.
                 if on
                     && let Some(mirek) = body
                         .pointer("/color_temperature/mirek")
@@ -804,7 +804,7 @@ mod room_chain_tests {
         assert_eq!(room_of_light(&found, "light-1").as_deref(), Some("Living Room"));
     }
 
-    /// The same, for a house organised into zones — whose children are light services rather
+    /// The same, for a house organized into zones — whose children are light services rather
     /// than devices. Every bulb used to come through unplaced.
     #[test]
     fn a_zone_naming_light_services_places_its_bulbs_too() {
@@ -862,7 +862,7 @@ mod tests {
     ///
     /// It is kept because a Hue room lists devices while a bulb is adopted by its light *service*,
     /// so the only route from one to the other is through the device that owns it. It is not
-    /// offered because the `/light` step builds bulbs properly, with the colour and dimming detail
+    /// offered because the `/light` step builds bulbs properly, with the color and dimming detail
     /// that decides their capabilities. The bridge is neither kept nor offered.
     #[test]
     fn a_bulb_is_kept_for_its_room_but_not_offered_as_a_device() {
@@ -924,13 +924,13 @@ mod tests {
         let rooms = json!({ "data": [
             { "id": "room-1", "metadata": { "name": "Hall" }, "children": [] },
         ]});
-        let behaviours = json!({ "data": [{
+        let behaviors = json!({ "data": [{
             "configuration": {
                 "device": { "rid": "dev-Hall dimmer", "rtype": "device" },
                 "where": [{ "group": { "rid": "room-1", "rtype": "room" } }],
             },
         }]});
-        apply_behaviours(&mut catalog, Some(&behaviours), &room_names(Some(&rooms)));
+        apply_behaviors(&mut catalog, Some(&behaviors), &room_names(Some(&rooms)));
 
         let offered = candidates(&catalog, "10.0.0.2", "key");
         let made = rules(&catalog, &offered);
@@ -982,12 +982,12 @@ mod tests {
         );
     }
 
-    /// A Hue scene comes over as the levels and colours it actually is.
+    /// A Hue scene comes over as the levels and colors it actually is.
     ///
     /// The detail is the whole value: "Relax" is not a room at 40%, it is one lamp warm and low
     /// and another off, and that is a thing nobody would reconstruct from a description.
     #[test]
-    fn a_scene_becomes_a_level_and_a_colour_per_light() {
+    fn a_scene_becomes_a_level_and_a_color_per_light() {
         // Two lights in two different rooms — an open plan, as far as the bridge is concerned
         // a zone, and as far as anybody standing there is concerned one space.
         let offered = vec![
@@ -1123,16 +1123,16 @@ mod tests {
             { "id": "room-1", "metadata": { "name": "Kitchen" }, "children": [] },
         ]});
         let names = room_names(Some(&rooms));
-        // The shape a Hue "dimmer switch" behaviour actually has: the device nested somewhere in a
+        // The shape a Hue "dimmer switch" behavior actually has: the device nested somewhere in a
         // configuration whose layout is the script's business, and the room it drives beside it.
-        let behaviours = json!({ "data": [{
+        let behaviors = json!({ "data": [{
             "id": "beh-1",
             "configuration": {
                 "device": { "rid": "dev-Hue dimmer switch 2", "rtype": "device" },
                 "where": [{ "group": { "rid": "room-1", "rtype": "room" } }],
             },
         }]});
-        apply_behaviours(&mut catalog, Some(&behaviours), &names);
+        apply_behaviors(&mut catalog, Some(&behaviors), &names);
 
         let offered = candidates(&catalog, "10.0.0.2", "key");
         assert_eq!(

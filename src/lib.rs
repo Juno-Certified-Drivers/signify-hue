@@ -158,13 +158,13 @@ fn level_body(level: u8, ramp_ms: Option<u64>) -> Value {
 }
 
 /// CIE xy from hue/saturation at full value. The bridge wants a gamut point, not HSV.
-/// The inverse of [`hs_to_xy`], for reading a bulb's colour back off the bridge.
+/// The inverse of [`hs_to_xy`], for reading a bulb's color back off the bridge.
 ///
 /// The bridge answers in CIE xy and the `light` contract is hue and saturation, so without this
 /// the raw chromaticity went straight into those fields: a lamp reported `hue = 0.2858`,
-/// `sat = 0.3083` where the contract means degrees and percent. Every surface reading colour —
+/// `sat = 0.3083` where the contract means degrees and percent. Every surface reading color —
 /// the tile, the scene editor capturing what a room looks like now — got a number a hundredth
-/// of the size it expected and drew the wrong colour.
+/// of the size it expected and drew the wrong color.
 ///
 /// Luminance is fixed at 1.0 on the way back: xy carries no brightness, which is `level`'s job,
 /// and reconstructing one here would fight it.
@@ -576,7 +576,7 @@ fn grouped_command(
                     scratch.insert("level".into(), json!(level));
                 }
                 scratch.insert("on".into(), json!(level > 0));
-                calls.extend(HueBulb::optimistic(level));
+                calls.extend(HueBulb::optimiztic(level));
             }
             if command == "set_cct"
                 && let Some(kelvin) = args.get("kelvin").and_then(Value::as_u64)
@@ -880,7 +880,7 @@ impl HueBulb {
     /// An event carries only the fields that moved: brightness alone when someone drags a
     /// slider, `on` alone when they flick a switch. So a missing field means "unchanged", and
     /// the remembered value fills it in — reading it as zero would darken the bulb on screen
-    /// every time somebody changed its colour.
+    /// every time somebody changed its color.
     fn report(inst: &mut Instance, light: &Value) -> Vec<HostCall> {
         // The startup light collection is also the requested one-time effects_v2 re-scan. Each
         // adopted bulb keeps only its own advertised values for later scene validation.
@@ -957,7 +957,7 @@ impl HueBulb {
     /// The bulb is on a mesh; a round trip is 100–300 ms and the UI would visibly lag. We
     /// state the intent now and let the next poll correct us if the bridge disagreed — which
     /// is what every Hue integration worth using does.
-    fn optimistic(level: u8) -> Vec<HostCall> {
+    fn optimiztic(level: u8) -> Vec<HostCall> {
         // Power as well as brightness, since core no longer infers one from the other. Without
         // this the tile waits a bridge round trip to show a lamp somebody just switched off —
         // and `level_changed` alone would now leave it reading "on" the whole time.
@@ -1001,7 +1001,7 @@ impl DriverModule for HueBulb {
         let (body, level) = match cmd {
             "on" => {
                 // Let the bridge restore its authoritative last level. The remembered value is
-                // only for an immediate optimistic notification; it is not sent as brightness.
+                // only for an immediate optimiztic notification; it is not sent as brightness.
                 let restore = if last == 0 { 100 } else { last };
                 (power_body(true, ramp), Some(restore))
             }
@@ -1066,7 +1066,7 @@ impl DriverModule for HueBulb {
                 inst.scratch.insert("level".into(), json!(l));
             }
             inst.scratch.insert("on".into(), json!(l > 0));
-            out.extend(Self::optimistic(l));
+            out.extend(Self::optimiztic(l));
         }
         if cmd == "set_cct"
             && let Some(k) = args.get("kelvin").and_then(Value::as_u64)
@@ -1566,7 +1566,7 @@ mod pairing_tests {
     fn a_paired_bulb_is_offered_once_and_not_six_times() {
         // What the bridge actually pushes when one bulb is paired in the Hue app: the device
         // and every service hanging off it, each as its own `add`. Only the device is a thing
-        // a person would recognise as "a new light".
+        // a person would recognize as "a new light".
         let device = json!({
             "id": "b8b7-1", "type": "device",
             "metadata": { "name": "Porch" },
@@ -2171,7 +2171,7 @@ impl HueBulb {
                         note: "reading what the switches already control".into(),
                     },
                     json!({
-                        "phase": "behaviours",
+                        "phase": "behaviors",
                         "address": address,
                         "key": key,
                         "catalog": found,
@@ -2189,7 +2189,7 @@ impl HueBulb {
             // place: "controls the Kitchen" is a usable name for a thing the app called "Hue
             // dimmer switch 2", and for a battery remote sitting in no Hue room at all it is the
             // best answer available to where the thing is.
-            "behaviours" => {
+            "behaviors" => {
                 let address = address.unwrap_or_default();
                 let key = state
                     .get("key")
@@ -2202,7 +2202,7 @@ impl HueBulb {
                     .cloned()
                     .unwrap_or_default();
                 let names = state.get("rooms").cloned().unwrap_or(Value::Null);
-                catalog::apply_behaviours(&mut found, input.get("response"), &names);
+                catalog::apply_behaviors(&mut found, input.get("response"), &names);
                 (
                     SetupStep::Fetch {
                         request: HttpRequest::new(
@@ -2323,9 +2323,9 @@ impl HueBulb {
                             None => "cannot be reached — is it powered?",
                             _ => "",
                         };
-                        // A Hue `light` is not necessarily a colour bulb. The manifest is the
+                        // A Hue `light` is not necessarily a color bulb. The manifest is the
                         // source of the controls core accepts, so this choice must happen here
-                        // at import time — hiding a colour wheel in the UI would still let a
+                        // at import time — hiding a color wheel in the UI would still let a
                         // rule send `set_color` to a white bulb. `null` is not a capability;
                         // the bridge uses it for a resource it cannot describe at the moment.
                         let (driver_id, _) = bulb_driver(light);
@@ -2516,14 +2516,14 @@ impl HueBulb {
 /// Select the narrowest bulb manifest for what one CLIP v2 light actually exposes.
 ///
 /// The shared native module routes all of these by `Light id`, so separate manifests do not
-/// create separate driver behaviour. They make the feature flags part of the resolved proxy
+/// create separate driver behavior. They make the feature flags part of the resolved proxy
 /// contract: controls, automations, and API validation therefore agree on what this particular
 /// fitting can do.
 fn bulb_driver(light: &Value) -> (&'static str, &'static str) {
     let has = |name: &str| light.get(name).and_then(Value::as_object).is_some();
     match (has("color"), has("color_temperature"), has("dimming")) {
-        (true, true, _) => ("signify.hue.bulb", "colour and tunable white"),
-        (true, false, _) => ("signify.hue.bulb.color", "colour"),
+        (true, true, _) => ("signify.hue.bulb", "color and tunable white"),
+        (true, false, _) => ("signify.hue.bulb.color", "color"),
         (false, true, true) => ("signify.hue.bulb.tunable", "tunable white"),
         (false, true, false) => ("signify.hue.bulb.tunable", "tunable white"),
         (false, false, true) => ("signify.hue.bulb.dimmable", "dimmable"),
@@ -2584,15 +2584,15 @@ mod bulb_capability_tests {
     }
 
     #[test]
-    fn a_white_hue_light_gets_a_manifest_without_colour_commands() {
+    fn a_white_hue_light_gets_a_manifest_without_color_commands() {
         let white = json!({ "dimming": {} });
         assert_eq!(bulb_driver(&white).0, "signify.hue.bulb.dimmable");
 
         let tunable = json!({ "dimming": {}, "color_temperature": {} });
         assert_eq!(bulb_driver(&tunable).0, "signify.hue.bulb.tunable");
 
-        let colour = json!({ "dimming": {}, "color": {} });
-        assert_eq!(bulb_driver(&colour).0, "signify.hue.bulb.color");
+        let color = json!({ "dimming": {}, "color": {} });
+        assert_eq!(bulb_driver(&color).0, "signify.hue.bulb.color");
     }
 
     #[test]
@@ -2614,14 +2614,14 @@ mod bulb_capability_tests {
 
 
 #[cfg(test)]
-mod colour_round_trip {
+mod color_round_trip {
     use super::*;
 
     /// What goes out has to come back. The bridge answers in CIE xy and the contract is degrees
     /// and percent, so without the conversion a lamp reported `hue = 0.2858` where the contract
-    /// means a number up to 360 — and every surface reading colour drew the wrong one.
+    /// means a number up to 360 — and every surface reading color drew the wrong one.
     #[test]
-    fn a_colour_survives_the_trip_through_xy() {
+    fn a_color_survives_the_trip_through_xy() {
         for (hue, sat) in [(0.0, 100.0), (120.0, 100.0), (240.0, 100.0), (30.0, 60.0), (200.0, 45.0)] {
             let (x, y) = hs_to_xy(hue, sat);
             let (back_hue, back_sat) = xy_to_hs(x, y);
@@ -2643,16 +2643,16 @@ mod colour_round_trip {
         let light = json!({ "color": { "xy": { "x": 0.2858, "y": 0.3083 } } });
 
         let said = HueBulb::report(&mut inst, &light);
-        let colour = said
+        let color = said
             .iter()
             .find_map(|c| match c {
                 HostCall::Notify { name, args, .. } if name == "color_changed" => Some(args.clone()),
                 _ => None,
             })
-            .expect("reports a colour");
+            .expect("reports a color");
 
-        let hue = colour.get("hue").and_then(Value::as_f64).unwrap();
-        let sat = colour.get("sat").and_then(Value::as_f64).unwrap();
+        let hue = color.get("hue").and_then(Value::as_f64).unwrap();
+        let sat = color.get("sat").and_then(Value::as_f64).unwrap();
         assert!((0.0..=360.0).contains(&hue), "hue out of range: {hue}");
         assert!((0.0..=100.0).contains(&sat), "sat out of range: {sat}");
         assert!(hue > 1.0, "a blue-ish xy is not hue 0.2858 — got {hue}");

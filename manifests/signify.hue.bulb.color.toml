@@ -1,6 +1,6 @@
 [driver]
 id = "signify.hue.bulb.color"
-name = "Philips Hue Colour Bulb"
+name = "Philips Hue Color Bulb"
 manufacturer = "Signify"
 version = "1.4.0"
 runtime = "wasm"

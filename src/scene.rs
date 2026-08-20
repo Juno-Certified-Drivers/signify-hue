@@ -193,7 +193,7 @@ fn capabilities(member: &SceneMember) -> BTreeSet<String> {
 
 fn validate_animation(request: &SceneRequest) -> Result<(), String> {
     if request.animation.palette.len() > 9 {
-        return Err("Hue dynamic palettes support at most 9 colours".into());
+        return Err("Hue dynamic palettes support at most 9 colors".into());
     }
     if request
         .animation

@@ -46,7 +46,7 @@ Setup then reads five collections in turn and offers all of it at once:
 | `/button` | `control_id`, so buttons are offered in the order printed on the remote |
 | `/room` | Where the bridge says everything lives |
 | `/behavior_instance` | What the bridge already has each switch driving |
-| `/light` | The bulbs, with the colour and dimming detail that decides their capabilities |
+| `/light` | The bulbs, with the color and dimming detail that decides their capabilities |
 
 A bridge carrying accessories and no bulbs of its own is a real setup and is not refused.
 
@@ -72,13 +72,13 @@ drives is the best available answer to where it is.
 
 ### Bringing the rules over
 
-The behaviours are also offered as Juno automations, and they arrive **switched off** and tagged
+The behaviors are also offered as Juno automations, and they arrive **switched off** and tagged
 with the driver that read them. That is the whole of what makes it safe: an imported rule is this
 driver's *interpretation* of somebody else's automation, and nothing should start behaving
 differently in a house because a bridge was adopted. They land on the Automations page as
 proposals with their origin written on them.
 
-How much of an interpretation is worth being plain about. A Hue behaviour says *that* a switch
+How much of an interpretation is worth being plain about. A Hue behavior says *that* a switch
 drives a room; the per-button detail lives in a script whose shape is the script's own business and
 changes between versions. So what is reconstructed is the layout every Hue remote has had since the
 first one:
@@ -102,7 +102,7 @@ Every imported rule crosses the same gate a hand-written one does. A trigger mus
 contract declares, a room command must exist, arguments are range-checked. Anything that does not
 survive that is reported and dropped rather than bent until it fits.
 
-The configuration inside a behaviour is shaped by whichever script it is an instance of, and those
+The configuration inside a behavior is shaped by whichever script it is an instance of, and those
 shapes are neither documented nor stable. Rather than walk a known path — which would work for
 today's dimmer script and quietly stop working for the next one — the driver collects every
 `{rid, rtype}` anywhere in the structure and keeps the ones that name a room. Deliberately
