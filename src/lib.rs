@@ -158,6 +158,59 @@ fn level_body(level: u8, ramp_ms: Option<u64>) -> Value {
 }
 
 /// CIE xy from hue/saturation at full value. The bridge wants a gamut point, not HSV.
+/// The inverse of [`hs_to_xy`], for reading a bulb's colour back off the bridge.
+///
+/// The bridge answers in CIE xy and the `light` contract is hue and saturation, so without this
+/// the raw chromaticity went straight into those fields: a lamp reported `hue = 0.2858`,
+/// `sat = 0.3083` where the contract means degrees and percent. Every surface reading colour —
+/// the tile, the scene editor capturing what a room looks like now — got a number a hundredth
+/// of the size it expected and drew the wrong colour.
+///
+/// Luminance is fixed at 1.0 on the way back: xy carries no brightness, which is `level`'s job,
+/// and reconstructing one here would fight it.
+fn xy_to_hs(x: f64, y: f64) -> (f64, f64) {
+    if y <= 0.0 {
+        return (0.0, 0.0);
+    }
+    // xyY -> XYZ at full luminance, then the inverse of the Wide RGB D65 matrix above.
+    let (big_x, big_y, big_z) = (x / y, 1.0, (1.0 - x - y) / y);
+    // The exact inverse of the matrix in `hs_to_xy`, computed from it rather than copied from
+    // the widely-quoted Philips one — those two are not each other, and the mismatch put full
+    // blue back as 257 degrees instead of 240.
+    let r = big_x * 1.611_757 + big_y * -0.202_805 + big_z * -0.302_298;
+    let g = big_x * -0.509_057 + big_y * 1.411_914 + big_z * 0.066_070;
+    let b = big_x * 0.026_086 + big_y * -0.072_353 + big_z * 0.962_086;
+    // Scale while still linear, then gamma-encode. The other order runs the curve over values
+    // above 1 — a saturated blue leaves this matrix at b ≈ 46 — and the curve is not linear, so
+    // the ratios between the channels come out changed and the hue with them.
+    let max = r.max(g).max(b);
+    if max <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let srgb = |u: f64| {
+        let u = (u / max).clamp(0.0, 1.0);
+        if u <= 0.003_130_8 {
+            12.92 * u
+        } else {
+            1.055 * u.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    let (r, g, b) = (srgb(r), srgb(g), srgb(b));
+    let min = r.min(g).min(b);
+    let delta = 1.0 - min;
+    if delta <= f64::EPSILON {
+        return (0.0, 0.0); // white: no hue to report
+    }
+    let hue = if r >= g && r >= b {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if g >= b {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    (hue.rem_euclid(360.0), (delta * 100.0).clamp(0.0, 100.0))
+}
+
 fn hs_to_xy(hue_deg: f64, sat_pct: f64) -> (f64, f64) {
     let h = hue_deg.rem_euclid(360.0) / 60.0;
     let s = (sat_pct / 100.0).clamp(0.0, 1.0);
@@ -888,9 +941,12 @@ impl HueBulb {
             light.pointer("/color/xy/x").and_then(Value::as_f64),
             light.pointer("/color/xy/y").and_then(Value::as_f64),
         ) {
+            // Converted, not passed through. The contract's `hue` is degrees and `sat` is
+            // percent; the bridge answers in CIE xy — see `xy_to_hs`.
+            let (hue, sat) = xy_to_hs(x, y);
             let mut a = Args::new();
-            a.insert("hue".into(), json!(x));
-            a.insert("sat".into(), json!(y));
+            a.insert("hue".into(), json!((hue * 10.0).round() / 10.0));
+            a.insert("sat".into(), json!((sat * 10.0).round() / 10.0));
             out.push(HostCall::notify(1, "color_changed", a));
         }
         out
@@ -2553,6 +2609,53 @@ mod bulb_capability_tests {
             "color": null
         });
         assert_eq!(bulb_driver(&warm_white).0, "signify.hue.bulb.tunable");
+    }
+}
+
+
+#[cfg(test)]
+mod colour_round_trip {
+    use super::*;
+
+    /// What goes out has to come back. The bridge answers in CIE xy and the contract is degrees
+    /// and percent, so without the conversion a lamp reported `hue = 0.2858` where the contract
+    /// means a number up to 360 — and every surface reading colour drew the wrong one.
+    #[test]
+    fn a_colour_survives_the_trip_through_xy() {
+        for (hue, sat) in [(0.0, 100.0), (120.0, 100.0), (240.0, 100.0), (30.0, 60.0), (200.0, 45.0)] {
+            let (x, y) = hs_to_xy(hue, sat);
+            let (back_hue, back_sat) = xy_to_hs(x, y);
+            // Circular distance: 0 and 359 are one degree apart, not 359.
+            let apart = (back_hue - hue).abs();
+            let apart = apart.min(360.0 - apart);
+            assert!(apart < 2.0, "hue {hue} came back as {back_hue}");
+            assert!((back_sat - sat).abs() < 6.0, "sat {sat} came back as {back_sat}");
+        }
+    }
+
+    /// The reading a real bulb gave, which used to arrive as the hue itself.
+    #[test]
+    fn a_bridge_reading_becomes_degrees_and_percent() {
+        let mut inst = Instance::default();
+        inst.properties.insert("Bridge address".into(), json!("10.0.0.2"));
+        inst.properties.insert("Application key".into(), json!("k"));
+        inst.properties.insert("Light id".into(), json!("l1"));
+        let light = json!({ "color": { "xy": { "x": 0.2858, "y": 0.3083 } } });
+
+        let said = HueBulb::report(&mut inst, &light);
+        let colour = said
+            .iter()
+            .find_map(|c| match c {
+                HostCall::Notify { name, args, .. } if name == "color_changed" => Some(args.clone()),
+                _ => None,
+            })
+            .expect("reports a colour");
+
+        let hue = colour.get("hue").and_then(Value::as_f64).unwrap();
+        let sat = colour.get("sat").and_then(Value::as_f64).unwrap();
+        assert!((0.0..=360.0).contains(&hue), "hue out of range: {hue}");
+        assert!((0.0..=100.0).contains(&sat), "sat out of range: {sat}");
+        assert!(hue > 1.0, "a blue-ish xy is not hue 0.2858 — got {hue}");
     }
 }
 
